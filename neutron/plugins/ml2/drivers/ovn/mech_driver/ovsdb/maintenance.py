@@ -1004,10 +1004,19 @@ class DBInconsistenciesPeriodics(SchemaAwarePeriodicsBase):
         for ls in self._nb_idl.ls_list().execute(check_error=True):
             if ovn_const.OVN_NETTYPE_EXT_ID_KEY not in ls.external_ids:
                 net_id = utils.get_neutron_name(ls.name)
-                external_ids = {
-                    ovn_const.OVN_NETTYPE_EXT_ID_KEY: net_segments[net_id]}
-                cmds.append(self._nb_idl.db_set(
-                    'Logical_Switch', ls.uuid, ('external_ids', external_ids)))
+                network_type = net_segments.get(net_id)
+                if not network_type:
+                    LOG.debug("Logical switch %s (id %s) is not managed by Neutron; "
+                            "skipping network_type population",
+                            ls.name, net_id)
+                    continue
+
+                cmds.append(
+                    self._nb_idl.db_set(
+                        'Logical_Switch', ls.uuid,
+                        ('external_ids',
+                        {ovn_const.OVN_NETTYPE_EXT_ID_KEY: network_type}))
+                )
 
         if cmds:
             with self._nb_idl.transaction(check_error=True) as txn:
