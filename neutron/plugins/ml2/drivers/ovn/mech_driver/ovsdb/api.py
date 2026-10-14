@@ -260,6 +260,41 @@ class API(api.API, metaclass=abc.ABCMeta):
         """
 
     @abc.abstractmethod
+    def ensure_acl_sampling_resources(self, config):
+        """Create or update the Neutron owned ACL sampling rows.
+
+        :param config: The operator configured sampling identifiers
+        :type config:  neutron.common.ovn.sampling.SamplingConfig
+        :returns:      :class:`Command` with the Neutron Sample_Collector
+                       UUID as result
+        :raises:       OVNSamplingResourceConflict if a row with the same
+                       application type or ID, or collector ID, is not
+                       owned by Neutron
+        """
+
+    @abc.abstractmethod
+    def set_port_group_acl_sampling(self, port_group, acl_actions,
+                                    collector_id, if_exists=True,
+                                    raise_on_conflict=False):
+        """Converge the Neutron sample references of a Port Group's ACLs.
+
+        :param port_group:   The Port Group name
+        :type port_group:    string
+        :param acl_actions:  The ACL actions to sample; empty to remove all
+                             Neutron sample references of the Port Group
+        :type acl_actions:   set of strings
+        :param collector_id: The ID of the Neutron Sample_Collector
+        :type collector_id:  int or None
+        :param if_exists:    Do not fail if the Port Group does not exist
+        :type if_exists:     bool
+        :param raise_on_conflict: Fail if a required reference is not
+                             managed by Neutron instead of reporting it
+        :type raise_on_conflict: bool
+        :returns:            :class:`Command` with a dict of conflicts and
+                             counters as result
+        """
+
+    @abc.abstractmethod
     def get_acl_by_id(self, acl_id):
         """Get an ACL by its ID.
 
