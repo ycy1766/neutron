@@ -204,6 +204,17 @@ class TestDBInconsistenciesPeriodics(testlib_api.SqlTestCaseLight,
             self.fake_ovn_client)
         self.ctx = context.get_admin_context()
 
+    def test_check_acl_sampling_consistency(self):
+        driver = mock.Mock()
+        driver.reconcile_sampling.return_value = ['sg1', 'sg2']
+        with mock.patch.object(maintenance.ovn_log_driver, 'DRIVER', driver):
+            self.periodic.check_acl_sampling_consistency()
+        driver.reconcile_sampling.assert_called_once_with(mock.ANY)
+
+    def test_check_acl_sampling_consistency_no_driver(self):
+        with mock.patch.object(maintenance.ovn_log_driver, 'DRIVER', None):
+            self.periodic.check_acl_sampling_consistency()
+
     @mock.patch.object(maintenance.DBInconsistenciesPeriodics,
                        '_fix_create_update')
     @mock.patch.object(ovn_revision_numbers_db, 'get_inconsistent_resources')
