@@ -10,6 +10,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import collections
 from collections import namedtuple
 import secrets
 
@@ -27,6 +28,7 @@ from ovsdbapp.backend.ovs_idl import idlutils
 from neutron._i18n import _
 from neutron.common.ovn import acl as acl_utils
 from neutron.common.ovn import constants as ovn_const
+from neutron.common.ovn import sampling as ovn_sampling
 from neutron.common.ovn import utils
 from neutron.conf.services import logging as log_cfg
 from neutron.objects import securitygroup as sg_obj
@@ -40,14 +42,42 @@ LOG = logging.getLogger(__name__)
 DRIVER = None
 
 log_cfg.register_log_driver_opts()
+log_cfg.register_ovn_acl_sampling_opts()
 
 MAX_INT_LABEL = 2**32
 SUPPORTED_LOGGING_TYPES = (log_const.SECURITY_GROUP,)
+
+# TODO(ycy1766): Use the neutron-lib definitions once the
+# "logging-output-type" API extension is available.
+OUTPUT_PACKET_LOG = 'packet_log'
+OUTPUT_FLOW_SAMPLE = 'flow_sample'
+DROP_LOG_EVENTS = (log_const.DROP_EVENT, log_const.ALL_EVENT)
+
+
+def log_output_type(log_obj):
+    """Return the output of a log object, defaulting to packet logging."""
+    return getattr(log_obj, 'output_type', None) or OUTPUT_PACKET_LOG
+
+
+def is_flow_sample_log(log_obj):
+    return log_output_type(log_obj) == OUTPUT_FLOW_SAMPLE
 
 
 class LoggingNotSupported(n_exceptions.NeutronException):
     message = _("The current OVN version does not offer support "
                 "for neutron network log functionality.")
+
+
+class FlowSamplingNotAvailable(n_exceptions.InvalidInput):
+    message = _("OVN ACL sampling is not enabled in the Neutron "
+                "configuration or not supported by the OVN Northbound "
+                "database.")
+
+
+class FlowSampleSelectorNotSupported(n_exceptions.InvalidInput):
+    message = _("A network log with the flow_sample output must select a "
+                "security group with resource_id and must not set "
+                "target_id.")
 
 
 class OVNDriver(base.DriverBase):
@@ -86,6 +116,16 @@ class OVNDriver(base.DriverBase):
         log_objs = self._log_plugin.get_logs(
             context, filters=filters or None)
         return [self._log_dict_to_obj(lo) for lo in log_objs]
+
+    def _get_packet_logs(self, context, **filters):
+        """Return the log objects using the packet logging output."""
+        return [lo for lo in self._get_logs(context, **filters)
+                if not is_flow_sample_log(lo)]
+
+    def _get_flow_sample_logs(self, context, **filters):
+        """Return the log objects using the flow sampling output."""
+        return [lo for lo in self._get_logs(context, **filters)
+                if is_flow_sample_log(lo)]
 
     @property
     def _ovn_client(self):
@@ -199,8 +239,7 @@ class OVNDriver(base.DriverBase):
                     'meter': meter_name,
                     'name': log_name,
                     'severity': "info",
-                    'label': secrets.SystemRandom().randrange(
-                        1, MAX_INT_LABEL),
+                    'label': self._acl_log_label(acl),
                     'options': {'log-related': "true"},
                 }
                 ovn_txn.add(self.ovn_nb.db_set(
@@ -208,6 +247,22 @@ class OVNDriver(base.DriverBase):
                 acl_changes += 1
         LOG.info("Set %d (out of %d visited) ACLs for network log %s",
                  acl_changes, acl_visits, log_name)
+
+    @staticmethod
+    def _acl_log_label(acl):
+        """Return the label to use for a logged ACL.
+
+        A nonzero label takes precedence over the Sample metadata as the
+        observation point emitted by OVN sampling. If Neutron samples the
+        ACL, reuse the new-stage Sample metadata so that adding packet
+        logging does not change the emitted value.
+        """
+        if ovn_sampling.referenced_sample(acl, ovn_sampling.STAGE_NEW):
+            metadata = ovn_sampling.recorded_metadata(
+                acl, ovn_sampling.STAGE_NEW)
+            if metadata:
+                return metadata
+        return secrets.SystemRandom().randrange(1, MAX_INT_LABEL)
 
     def _update_log_objs(self, context, ovn_txn, log_objs):
         for log_obj in log_objs:
@@ -289,7 +344,11 @@ class OVNDriver(base.DriverBase):
         global neutron_pg_drop. This ensures drop events are correctly
         attributed to the specific security group's log resource.
         """
-        if log_obj.event not in (log_const.DROP_EVENT, log_const.ALL_EVENT):
+        if log_obj.event not in DROP_LOG_EVENTS:
+            return
+        if is_flow_sample_log(log_obj):
+            # The sampling reconciliation creates the drop ACLs of a
+            # flow-sample log without enabling packet logging.
             return
         sg_pgs = self._get_sg_port_groups(context, log_obj)
         for pg in sg_pgs:
@@ -298,9 +357,22 @@ class OVNDriver(base.DriverBase):
                 ovn_txn.add(self.ovn_nb.pg_acl_add(**acl, may_exist=True))
 
     def _remove_sg_drop_acls(self, context, log_obj, ovn_txn):
-        """Remove per-SG drop ACLs created for network log attribution."""
+        """Remove per-SG drop ACLs created for network log attribution.
+
+        The drop ACLs of a security group are shared by both network log
+        outputs. They are kept while an enabled flow-sample log still
+        observes the drops of that security group; the packet logging
+        columns of those ACLs are cleared separately.
+        """
         sg_pgs = self._get_sg_port_groups(context, log_obj)
         for pg in sg_pgs:
+            sg_id = pg["external_ids"].get(ovn_const.OVN_SG_EXT_ID_KEY)
+            if sg_id and self._get_flow_sample_logs(
+                    context, enabled=True, resource_id=sg_id,
+                    event=list(DROP_LOG_EVENTS)):
+                LOG.debug("Keeping drop ACLs of Port Group %s for its "
+                          "flow-sample network logs", pg["name"])
+                continue
             for direction, p in (('from-lport', 'inport'),
                                  ('to-lport', 'outport')):
                 ovn_txn.add(self.ovn_nb.pg_acl_del(
@@ -310,8 +382,7 @@ class OVNDriver(base.DriverBase):
 
     def _get_other_sg_drop_logs(self, context, log_obj):
         """Get other enabled logs that still need per-SG drop ACLs."""
-        drop_events = (log_const.DROP_EVENT, log_const.ALL_EVENT)
-        filters = {'enabled': True, 'event': list(drop_events)}
+        filters = {'enabled': True, 'event': list(DROP_LOG_EVENTS)}
         log_objs = []
         if log_obj.resource_id:
             log_objs.extend(self._get_logs(
@@ -346,6 +417,12 @@ class OVNDriver(base.DriverBase):
         """
         LOG.debug("Create_log %s", log_obj)
 
+        if is_flow_sample_log(log_obj):
+            self._check_flow_sample_log(log_obj)
+            self._sync_sg_sampling(context, [log_obj.resource_id],
+                                   strict=True)
+            return
+
         pgs = self._pgs_from_log_obj(context, log_obj)
         actions_enabled = self._acl_actions_enabled(log_obj)
         log_name = utils.ovn_name(log_obj.id)
@@ -378,7 +455,7 @@ class OVNDriver(base.DriverBase):
             return False
 
         pgs = self._pgs_from_log_obj(context, log_obj)
-        other_logs = [log for log in self._get_logs(context)
+        other_logs = [log for log in self._get_packet_logs(context)
                       if log.id != log_obj.id and log.enabled]
         if not other_logs:
             return False
@@ -414,6 +491,16 @@ class OVNDriver(base.DriverBase):
         """
         LOG.debug("Update_log %s", log_obj)
 
+        if is_flow_sample_log(log_obj):
+            if log_obj.enabled:
+                self._check_flow_sample_log(log_obj)
+                self._sync_sg_sampling(context, [log_obj.resource_id],
+                                       strict=True)
+            else:
+                self._sync_sg_sampling(context, [log_obj.resource_id],
+                                       remove_unused_drop_acls_for=log_obj)
+            return
+
         log_name = utils.ovn_name(log_obj.id)
         with self.ovn_nb.transaction(check_error=True) as ovn_txn:
 
@@ -432,6 +519,8 @@ class OVNDriver(base.DriverBase):
                 for log in other_sg_drop_logs:
                     self._create_sg_drop_acls(context, log, ovn_txn,
                                               utils.ovn_name(log.id))
+        self._resync_sampled_sgs(
+            context, self._sampling_sg_ids_for_log(context, log_obj))
 
     def delete_log(self, context, log_obj):
         """Delete a log_obj invocation.
@@ -442,9 +531,21 @@ class OVNDriver(base.DriverBase):
         """
         LOG.debug("Delete_log %s", log_obj)
 
+        if is_flow_sample_log(log_obj):
+            self._sync_sg_sampling(context, [log_obj.resource_id],
+                                   remove_unused_drop_acls_for=log_obj)
+            return
+
+        sampling_sg_ids = self._sampling_sg_ids_for_log(context, log_obj)
+        try:
+            self._delete_packet_log(context, log_obj)
+        finally:
+            self._resync_sampled_sgs(context, sampling_sg_ids)
+
+    def _delete_packet_log(self, context, log_obj):
         # If we are removing the last log_obj, let's clear log from all acls.
         # This is a simple way of ensuring that no acl logs are left behind!
-        log_objs = self._get_logs(context)
+        log_objs = self._get_packet_logs(context)
         if not log_objs or (
                 len(log_objs) == 1 and log_objs[0].id == log_obj.id):
             pgs = self._pgs_all()
@@ -485,11 +586,169 @@ class OVNDriver(base.DriverBase):
         """
         LOG.debug("Resource_update %s", log_objs)
 
+        packet_logs = [lo for lo in log_objs if not is_flow_sample_log(lo)]
+        if packet_logs:
+            with self.ovn_nb.transaction(check_error=True) as ovn_txn:
+                self._update_log_objs(context, ovn_txn, packet_logs)
+        sg_ids = set()
+        for log_obj in log_objs:
+            sg_ids.update(self._sampling_sg_ids_for_log(context, log_obj))
+        self._resync_sampled_sgs(context, sg_ids)
+
+    def _get_sampling_config(self):
+        """Return the sampling configuration, or None if disabled."""
+        try:
+            return ovn_sampling.SamplingConfig.from_conf(
+                cfg.CONF.network_log)
+        except ValueError as exc:
+            LOG.error("Invalid OVN ACL sampling configuration: %s", exc)
+            return None
+
+    def _sampling_schema_supported(self):
+        return all(self.ovn_nb.is_col_present(table, column)
+                   for table, column in ovn_sampling.REQUIRED_COLUMNS)
+
+    def _check_flow_sampling_available(self):
+        if (self._get_sampling_config() is None or
+                not self._sampling_schema_supported()):
+            raise FlowSamplingNotAvailable()
+
+    def _check_flow_sample_log(self, log_obj):
+        """Validate a flow-sample log before applying it.
+
+        The logging plugin validates requests before they reach the
+        driver; this check guards the driver against logs stored by a
+        server without that validation.
+        """
+        if not log_obj.resource_id or log_obj.target_id:
+            raise FlowSampleSelectorNotSupported()
+        self._check_flow_sampling_available()
+
+    def sync_security_group_sampling(self, context, sg_id, txn):
+        """Reapply the sampling of a security group whose ACLs changed.
+
+        Called by the ML2/OVN mechanism driver inside the transaction that
+        replaces the rule ACLs of a security group, so that the new ACLs
+        reference the Samples required by the enabled flow-sample logs.
+        """
+        self._sync_sg_sampling(context, [sg_id], only_if_sampled=True,
+                               txn=txn)
+
+    def _sampling_sg_ids_for_log(self, context, log_obj):
+        """Return the security groups whose ACLs a log object can modify."""
+        if log_obj.resource_id:
+            return [log_obj.resource_id]
+        if log_obj.target_id:
+            return db_api._get_sgs_attached_to_port(context,
+                                                    log_obj.target_id)
+        return []
+
+    def _resync_sampled_sgs(self, context, sg_ids):
+        """Reapply sampling after changes that can replace sampled ACLs.
+
+        Used after packet logging and security group rule changes. A
+        failure is logged rather than raised: the triggering change has
+        already been committed and must not be reported as failed because
+        of the sampling output of other logs.
+        """
+        try:
+            self._sync_sg_sampling(context, sg_ids, only_if_sampled=True)
+        except Exception:
+            LOG.exception("Failed to reapply OVN ACL sampling for security "
+                          "groups %s", sorted(sg_ids))
+
+    def _sync_sg_sampling(self, context, sg_ids, only_if_sampled=False,
+                          remove_unused_drop_acls_for=None, strict=False,
+                          txn=None):
+        """Converge the OVN ACL sampling of security groups.
+
+        The desired state of each security group is the union of its
+        enabled flow-sample logs. It is computed from the stored logs, so
+        the same call serves log changes, ACL replacement and recovery.
+
+        :param sg_ids: the security groups to reconcile.
+        :param only_if_sampled: skip the security groups without a
+            flow-sample log; used after packet logging changes that may
+            recreate sampled ACLs.
+        :param remove_unused_drop_acls_for: a disabled or deleted
+            flow-sample log; its per-SG drop ACLs are removed if no other
+            enabled log, of either output, still requires them.
+        :param strict: fail with a conflict instead of a warning when a
+            required ACL reference is not managed by Neutron; used for API
+            requests that enable sampling.
+        :param txn: an open Northbound transaction to add the commands to.
+            When given, the caller commits it and conflicts are not
+            reported.
+        """
+        sg_ids = sorted({sg_id for sg_id in sg_ids if sg_id})
+        if not sg_ids or not self._sampling_schema_supported():
+            return
+        config = self._get_sampling_config()
+        flow_logs = self._get_flow_sample_logs(context, resource_id=sg_ids)
+        if only_if_sampled:
+            sampled = {lo.resource_id for lo in flow_logs}
+            sg_ids = [sg_id for sg_id in sg_ids if sg_id in sampled]
+            if not sg_ids:
+                return
+
+        actions_by_sg = collections.defaultdict(set)
+        drop_acls_needed = set()
+        if config is not None:
+            for lo in flow_logs:
+                if not lo.enabled:
+                    continue
+                actions_by_sg[lo.resource_id] |= self._acl_actions_enabled(lo)
+                if lo.event in DROP_LOG_EVENTS:
+                    drop_acls_needed.add(lo.resource_id)
+
+        removed_log = remove_unused_drop_acls_for
+        remove_drop_acls = (
+            removed_log is not None and
+            removed_log.event in DROP_LOG_EVENTS and
+            removed_log.resource_id not in drop_acls_needed and
+            not self._get_other_sg_drop_logs(context, removed_log))
+
+        def add_commands(ovn_txn):
+            set_cmds = {}
+            if any(actions_by_sg.values()):
+                ovn_txn.add(self.ovn_nb.ensure_acl_sampling_resources(config))
+            if remove_drop_acls:
+                self._remove_sg_drop_acls(context, removed_log, ovn_txn)
+            for sg_id in sg_ids:
+                pg_name = utils.ovn_port_group_name(sg_id)
+                if self.ovn_nb.lookup('Port_Group', pg_name,
+                                      default=None) is None:
+                    LOG.info("Port Group %s not found, skipping its ACL "
+                             "sampling", pg_name)
+                    continue
+                if sg_id in drop_acls_needed:
+                    for acl in acl_utils.add_acls_for_sampling_drop_port_group(
+                            pg_name):
+                        ovn_txn.add(self.ovn_nb.pg_acl_add(**acl,
+                                                           may_exist=True))
+                set_cmds[sg_id] = ovn_txn.add(
+                    self.ovn_nb.set_port_group_acl_sampling(
+                        pg_name, actions_by_sg[sg_id],
+                        config.collector_id if config else None,
+                        raise_on_conflict=strict))
+            return set_cmds
+
+        if txn is not None:
+            add_commands(txn)
+            return
         with self.ovn_nb.transaction(check_error=True) as ovn_txn:
-            self._update_log_objs(context, ovn_txn, log_objs)
+            set_cmds = add_commands(ovn_txn)
+
+        for sg_id, cmd in set_cmds.items():
+            result = getattr(cmd, 'result', None)
+            if isinstance(result, dict) and result.get('conflicts'):
+                LOG.warning("Security group %(sg)s has ACL sample references "
+                            "that are not managed by Neutron and were left "
+                            "unchanged: %(conflicts)s",
+                            {'sg': sg_id, 'conflicts': result['conflicts']})
 
     def add_logging_options_to_acls(self, neutron_acls, context):
-        log_objs = self._get_logs(context)
+        log_objs = self._get_packet_logs(context)
         for log_obj in log_objs:
             pgs = self._pgs_from_log_obj(context, log_obj)
             actions_enabled = self._acl_actions_enabled(log_obj)
@@ -553,7 +812,7 @@ class OVNDriver(base.DriverBase):
         :param log_plugin: Currently loaded log_plugging.
         :param ctx: current running context information
         """
-        log_objs = self._get_logs(ctx)
+        log_objs = self._get_packet_logs(ctx)
         log_pgs = []
         for log_obj in log_objs:
             log_pgs.extend(self._pgs_from_log_obj(ctx, log_obj))

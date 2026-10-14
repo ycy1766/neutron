@@ -172,6 +172,18 @@ def add_acls_for_log_drop_port_group(pg_name, log_name, meter_name):
                               severity="info", meter_name=meter_name)
 
 
+def add_acls_for_sampling_drop_port_group(pg_name):
+    """Create per-SG drop ACLs without packet logging.
+
+    They use the same priority and match as the logging drop ACLs, so that
+    a security group's drops are observed on its own ACLs when only the
+    "flow_sample" network log output requires them. If packet logging is
+    also requested, the logging driver sets the logging columns on the same
+    ACLs.
+    """
+    return _add_acls_for_drop(pg_name, ovn_const.ACL_PRIORITY_LOG_DROP)
+
+
 def drop_all_ip_traffic_for_port(port):
     acl_list = []
     for direction, p in (('from-lport', 'inport'),

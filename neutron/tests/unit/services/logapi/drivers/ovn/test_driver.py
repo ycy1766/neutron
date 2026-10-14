@@ -10,6 +10,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import types
 from unittest import mock
 
 from neutron_lib.plugins import constants as plugin_constants
@@ -20,6 +21,8 @@ from ovsdbapp.backend.ovs_idl import idlutils
 from neutron.common import utils as neutron_utils
 
 from neutron.common.ovn import constants as ovn_const
+from neutron.common.ovn import exceptions as ovn_exc
+from neutron.common.ovn import sampling as ovn_sampling
 from neutron.common.ovn import utils as ovn_utils
 from neutron.objects import securitygroup as sg_obj
 from neutron.services.logapi.common import db_api
@@ -59,6 +62,7 @@ class TestOVNDriverBase(base.BaseTestCase):
         self.fake_cfg_network_log.local_output_log_base = None
         self.fake_cfg_network_log.rate_limit = FAKE_CFG_RATE
         self.fake_cfg_network_log.burst_limit = FAKE_CFG_BURST
+        self.fake_cfg_network_log.ovn_acl_sampling = False
 
         self._log_driver_property = None
 
@@ -482,6 +486,7 @@ class TestOVNDriver(TestOVNDriverBase):
         self._nb_ovn.pg_acl_add.assert_not_called()
 
     def test__remove_sg_drop_acls(self):
+        self.log_plugin.get_logs.return_value = []
         sg_id = uuidutils.generate_uuid()
         pg_name = ovn_utils.ovn_port_group_name(sg_id)
         pg = self._fake_pg(name=pg_name,
@@ -604,3 +609,308 @@ class TestOVNDriver(TestOVNDriverBase):
             [pg_dict], self.context, actions_enabled, 'test_obj_name', n_acls)
         self.assertFalse(n_acls[0]['log'])
         self.assertEqual('', n_acls[0]['name'])
+
+
+class TestOVNDriverFlowSample(TestOVNDriverBase):
+
+    def setUp(self):
+        super().setUp()
+        conf = self.fake_cfg_network_log
+        conf.ovn_acl_sampling = True
+        conf.ovn_acl_sampling_app_new_id = 11
+        conf.ovn_acl_sampling_app_est_id = 12
+        conf.ovn_acl_sampling_collector_id = 13
+        conf.ovn_acl_sampling_collector_set_id = 1000
+        conf.ovn_acl_sampling_probability = 65535
+        self.config = ovn_sampling.SamplingConfig(
+            app_new_id=11, app_est_id=12, collector_id=13,
+            collector_set_id=1000, probability=65535)
+        self._nb_ovn.is_col_present.return_value = True
+        self.sg_id = uuidutils.generate_uuid()
+        self.pg_name = ovn_utils.ovn_port_group_name(self.sg_id)
+        self.txn = self._nb_ovn.transaction.return_value.__enter__.return_value
+        self.txn.add.side_effect = lambda cmd: cmd
+        self.logs = []
+        self.log_plugin.get_logs.side_effect = self._get_logs
+        mock.patch.object(db_api, '_get_ports_attached_to_sg',
+                          return_value=[]).start()
+
+    def _get_logs(self, context, filters=None):
+        filters = filters or {}
+
+        def match(log, key, value):
+            values = value if isinstance(value, list) else [value]
+            return log[key] in values
+
+        return [log for log in self.logs
+                if all(match(log, k, v) for k, v in filters.items())]
+
+    def _log(self, **kwargs):
+        log = {'id': uuidutils.generate_uuid(),
+               'project_id': uuidutils.generate_uuid(),
+               'name': 'test-log',
+               'resource_type': log_const.SECURITY_GROUP,
+               'resource_id': self.sg_id,
+               'target_id': None,
+               'event': log_const.ALL_EVENT,
+               'enabled': True,
+               'output_type': ovn_driver.OUTPUT_FLOW_SAMPLE}
+        log.update(kwargs)
+        self.logs.append(log)
+        return self._log_driver._log_dict_to_obj(log)
+
+    def _set_call(self):
+        self._nb_ovn.set_port_group_acl_sampling.assert_called_once()
+        return self._nb_ovn.set_port_group_acl_sampling.call_args.args
+
+    def test_log_output_type_default(self):
+        legacy = self._log()
+        legacy = legacy._replace(output_type=None)
+        self.assertEqual(ovn_driver.OUTPUT_PACKET_LOG,
+                         ovn_driver.log_output_type(legacy))
+        log_obj = types.SimpleNamespace(id='log-without-output-type')
+        self.assertEqual(ovn_driver.OUTPUT_PACKET_LOG,
+                         ovn_driver.log_output_type(log_obj))
+
+    def test_create_log_sampling_disabled(self):
+        self.fake_cfg_network_log.ovn_acl_sampling = False
+        log_obj = self._log()
+        self.assertRaises(ovn_driver.FlowSamplingNotAvailable,
+                          self._log_driver.create_log, self.context, log_obj)
+        self._nb_ovn.set_port_group_acl_sampling.assert_not_called()
+
+    def test_create_log_schema_unsupported(self):
+        self._nb_ovn.is_col_present.return_value = False
+        log_obj = self._log()
+        self.assertRaises(ovn_driver.FlowSamplingNotAvailable,
+                          self._log_driver.create_log, self.context, log_obj)
+
+    def test_create_log_invalid_config(self):
+        self.fake_cfg_network_log.ovn_acl_sampling_probability = None
+        log_obj = self._log()
+        self.assertRaises(ovn_driver.FlowSamplingNotAvailable,
+                          self._log_driver.create_log, self.context, log_obj)
+
+    def test_create_log_rejects_port_selector(self):
+        log_obj = self._log(target_id=uuidutils.generate_uuid())
+        self.assertRaises(ovn_driver.FlowSampleSelectorNotSupported,
+                          self._log_driver.create_log, self.context, log_obj)
+        log_obj = self._log(resource_id=None)
+        self.assertRaises(ovn_driver.FlowSampleSelectorNotSupported,
+                          self._log_driver.create_log, self.context, log_obj)
+        self._nb_ovn.set_port_group_acl_sampling.assert_not_called()
+
+    def test_create_log_strict_conflict(self):
+        self._nb_ovn.set_port_group_acl_sampling.side_effect = (
+            ovn_exc.OVNSamplingResourceConflict(resource='ACL', reason='x'))
+        self.assertRaises(ovn_exc.OVNSamplingResourceConflict,
+                          self._log_driver.create_log, self.context,
+                          self._log())
+        self.assertTrue(self._nb_ovn.set_port_group_acl_sampling.call_args
+                        .kwargs['raise_on_conflict'])
+
+    def test_update_log_disable_is_not_strict(self):
+        log_obj = self._log(event=log_const.ACCEPT_EVENT, enabled=False)
+        self._log_driver.update_log(self.context, log_obj)
+        self.assertFalse(self._nb_ovn.set_port_group_acl_sampling.call_args
+                         .kwargs['raise_on_conflict'])
+
+    def test_sync_security_group_sampling_in_transaction(self):
+        self._log(event=log_const.ALL_EVENT)
+        txn = mock.Mock()
+        self._log_driver.sync_security_group_sampling(self.context,
+                                                      self.sg_id, txn)
+        self._nb_ovn.transaction.assert_not_called()
+        # Global rows, two drop ACLs and the Port Group command.
+        self.assertEqual(4, txn.add.call_count)
+        self.assertEqual(self.pg_name, self._set_call()[0])
+
+    def test_sync_security_group_sampling_unsampled_sg(self):
+        txn = mock.Mock()
+        self._log_driver.sync_security_group_sampling(self.context,
+                                                      self.sg_id, txn)
+        txn.add.assert_not_called()
+
+    def test__remove_sg_drop_acls_keeps_acls_for_flow_sample_log(self):
+        self._log(event=log_const.DROP_EVENT)
+        packet = self._log(event=log_const.DROP_EVENT,
+                           output_type=ovn_driver.OUTPUT_PACKET_LOG)
+        pg = mock.Mock(external_ids={ovn_const.OVN_SG_EXT_ID_KEY: self.sg_id},
+                       acls=[])
+        pg.name = self.pg_name
+        self._nb_ovn.lookup.return_value = pg
+        self._log_driver._remove_sg_drop_acls(self.context, packet, self.txn)
+        self._nb_ovn.pg_acl_del.assert_not_called()
+        self.logs = [log for log in self.logs
+                     if log['output_type'] == ovn_driver.OUTPUT_PACKET_LOG]
+        self._log_driver._remove_sg_drop_acls(self.context, packet, self.txn)
+        self.assertEqual(2, self._nb_ovn.pg_acl_del.call_count)
+
+    def test_create_log_all(self):
+        log_obj = self._log()
+        self._log_driver.create_log(self.context, log_obj)
+        self._nb_ovn.ensure_acl_sampling_resources.assert_called_once_with(
+            self.config)
+        pg_name, actions, collector_id = self._set_call()
+        self.assertEqual(self.pg_name, pg_name)
+        self.assertEqual(self._log_driver._acl_actions_enabled(log_obj),
+                         actions)
+        self.assertEqual(13, collector_id)
+        # Drop ACLs are created without enabling packet logging.
+        self.assertEqual(2, self._nb_ovn.pg_acl_add.call_count)
+        for call in self._nb_ovn.pg_acl_add.call_args_list:
+            self.assertFalse(call.kwargs['log'])
+            self.assertEqual(ovn_const.ACL_PRIORITY_LOG_DROP,
+                             call.kwargs['priority'])
+            self.assertTrue(call.kwargs['may_exist'])
+        # The packet logging path is not used.
+        self._nb_ovn.db_set.assert_not_called()
+        self.plugin_driver._ovn_client.create_ovn_fair_meter.\
+            assert_not_called()
+
+    def test_create_log_accept(self):
+        log_obj = self._log(event=log_const.ACCEPT_EVENT)
+        self._log_driver.create_log(self.context, log_obj)
+        _pg_name, actions, _collector_id = self._set_call()
+        self.assertNotIn(ovn_const.ACL_ACTION_DROP, actions)
+        self._nb_ovn.pg_acl_add.assert_not_called()
+
+    def test_create_log_missing_port_group(self):
+        self._nb_ovn.lookup.return_value = None
+        self._log_driver.create_log(self.context, self._log())
+        self._nb_ovn.set_port_group_acl_sampling.assert_not_called()
+        self._nb_ovn.pg_acl_add.assert_not_called()
+
+    def test_union_of_flow_sample_logs(self):
+        self._log(event=log_const.ACCEPT_EVENT)
+        log_obj = self._log(event=log_const.DROP_EVENT)
+        self._log(event=log_const.ALL_EVENT, enabled=False)
+        self._log(event=log_const.ALL_EVENT,
+                  output_type=ovn_driver.OUTPUT_PACKET_LOG)
+        self._log_driver.create_log(self.context, log_obj)
+        _pg_name, actions, _collector_id = self._set_call()
+        self.assertEqual(
+            self._log_driver._acl_actions_enabled(types.SimpleNamespace(
+                enabled=True, event=log_const.ALL_EVENT)),
+            actions)
+
+    def test_update_log_disable_removes_unused_drop_acls(self):
+        log_obj = self._log(event=log_const.DROP_EVENT, enabled=False)
+        self._log_driver.update_log(self.context, log_obj)
+        self._nb_ovn.ensure_acl_sampling_resources.assert_not_called()
+        self.assertEqual(2, self._nb_ovn.pg_acl_del.call_count)
+        self.assertEqual((self.pg_name, set(), 13), self._set_call())
+
+    def test_update_log_disable_keeps_drop_acls_for_packet_log(self):
+        self._log(event=log_const.DROP_EVENT,
+                  output_type=ovn_driver.OUTPUT_PACKET_LOG)
+        log_obj = self._log(event=log_const.DROP_EVENT, enabled=False)
+        self._log_driver.update_log(self.context, log_obj)
+        self._nb_ovn.pg_acl_del.assert_not_called()
+
+    def test_update_log_enable_sampling_disabled(self):
+        self.fake_cfg_network_log.ovn_acl_sampling = False
+        log_obj = self._log()
+        self.assertRaises(ovn_driver.FlowSamplingNotAvailable,
+                          self._log_driver.update_log, self.context, log_obj)
+
+    def test_update_log_disable_with_sampling_disabled(self):
+        # Disabling a log must work after the option has been turned off and
+        # detaches the Neutron references.
+        self.fake_cfg_network_log.ovn_acl_sampling = False
+        log_obj = self._log(event=log_const.ACCEPT_EVENT, enabled=False)
+        self._log_driver.update_log(self.context, log_obj)
+        self.assertEqual((self.pg_name, set(), None), self._set_call())
+
+    def test_delete_log_keeps_other_flow_sample_log(self):
+        self._log(event=log_const.ACCEPT_EVENT)
+        deleted = self._log(event=log_const.ALL_EVENT)
+        self.logs.pop()
+        self._log_driver.delete_log(self.context, deleted)
+        _pg_name, actions, _collector_id = self._set_call()
+        self.assertNotIn(ovn_const.ACL_ACTION_DROP, actions)
+        self.assertIn(ovn_const.ACL_ACTION_ALLOW_RELATED, actions)
+        self.assertEqual(2, self._nb_ovn.pg_acl_del.call_count)
+
+    def test_packet_log_delete_resyncs_sampled_sg(self):
+        self._log(event=log_const.DROP_EVENT)
+        packet = self._log(event=log_const.DROP_EVENT,
+                           output_type=ovn_driver.OUTPUT_PACKET_LOG)
+        self.logs.pop()
+        with mock.patch.object(self._log_driver, '_delete_packet_log') as dp:
+            self._log_driver.delete_log(self.context, packet)
+        dp.assert_called_once_with(self.context, packet)
+        pg_name, actions, _collector_id = self._set_call()
+        self.assertEqual(self.pg_name, pg_name)
+        self.assertIn(ovn_const.ACL_ACTION_DROP, actions)
+        # The drop ACLs are recreated for the flow-sample log.
+        self.assertEqual(2, self._nb_ovn.pg_acl_add.call_count)
+
+    def test_packet_log_change_skips_unsampled_sg(self):
+        packet = self._log(output_type=ovn_driver.OUTPUT_PACKET_LOG)
+        with mock.patch.object(self._log_driver, '_delete_packet_log'):
+            self._log_driver.delete_log(self.context, packet)
+        self._nb_ovn.set_port_group_acl_sampling.assert_not_called()
+
+    def test_resource_update_mixed_outputs(self):
+        packet = self._log(output_type=ovn_driver.OUTPUT_PACKET_LOG,
+                           resource_id=uuidutils.generate_uuid())
+        flow = self._log(event=log_const.ACCEPT_EVENT)
+        with mock.patch.object(self._log_driver, '_update_log_objs') as ulo:
+            self._log_driver.resource_update(self.context, [packet, flow])
+        ulo.assert_called_once_with(self.context, mock.ANY, [packet])
+        self.assertEqual(self.pg_name, self._set_call()[0])
+
+    def test_packet_log_resync_failure_is_not_raised(self):
+        self._log(event=log_const.DROP_EVENT)
+        packet = self._log(output_type=ovn_driver.OUTPUT_PACKET_LOG)
+        self._nb_ovn.ensure_acl_sampling_resources.side_effect = (
+            RuntimeError('conflict'))
+        with mock.patch.object(self._log_driver, '_delete_packet_log'), \
+                mock.patch.object(ovn_driver.LOG, 'exception') as m_exc:
+            self._log_driver.delete_log(self.context, packet)
+        m_exc.assert_called_once()
+
+    def test_flow_sample_log_failure_is_raised(self):
+        self._nb_ovn.ensure_acl_sampling_resources.side_effect = (
+            RuntimeError('conflict'))
+        self.assertRaises(RuntimeError, self._log_driver.create_log,
+                          self.context, self._log())
+
+    def test_conflicts_are_logged(self):
+        self._nb_ovn.set_port_group_acl_sampling.return_value = mock.Mock(
+            result={'conflicts': [('acl-uuid', 'new')], 'attached': 0,
+                    'detached': 0})
+        with mock.patch.object(ovn_driver.LOG, 'warning') as m_warning:
+            self._log_driver.create_log(self.context, self._log())
+        m_warning.assert_called_once()
+
+    def test_packet_paths_ignore_flow_sample_logs(self):
+        self._log(event=log_const.DROP_EVENT, resource_id=None)
+        n_acls = [{'port_group': ovn_const.OVN_DROP_PORT_GROUP_NAME,
+                   'priority': 1000,
+                   'action': 'drop',
+                   'log': False,
+                   'name': '',
+                   'severity': '',
+                   'direction': 'to-lport',
+                   'match': 'outport == @neutron_pg_drop && ip'}]
+        self._log_driver.add_logging_options_to_acls(n_acls, self.context)
+        self.assertFalse(n_acls[0]['log'])
+        self.assertEqual([], self._log_driver._get_all_log_pgs(self.context))
+
+    def test__create_sg_drop_acls_skips_flow_sample_log(self):
+        log_obj = self._log(event=log_const.DROP_EVENT)
+        self._log_driver._create_sg_drop_acls(self.context, log_obj,
+                                              self.txn, 'log_name')
+        self._nb_ovn.pg_acl_add.assert_not_called()
+
+    def test__acl_log_label(self):
+        key = ovn_const.OVN_ACL_SAMPLE_NEW_EXT_ID_KEY
+        sampled = mock.Mock(sample_new=[mock.Mock()],
+                            external_ids={key: '77'})
+        self.assertEqual(77, self._log_driver._acl_log_label(sampled))
+        unsampled = mock.Mock(sample_new=[], external_ids={key: '77'})
+        label = self._log_driver._acl_log_label(unsampled)
+        self.assertNotEqual(77, label)
+        self.assertTrue(0 < label < ovn_driver.MAX_INT_LABEL)

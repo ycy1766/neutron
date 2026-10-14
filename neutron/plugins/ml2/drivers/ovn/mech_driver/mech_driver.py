@@ -529,6 +529,9 @@ class OVNMechanismDriver(api.MechanismDriver):
                             context, rule, txn=txn)
                         self._ovn_client.create_security_group_rule(
                             context, rule, txn=txn)
+                    # The replaced ACLs lose their sampling references.
+                    self.log_driver.sync_security_group_sampling(
+                        context, security_group['id'], txn)
 
         ovn_revision_numbers_db.bump_revision(
             context, security_group, ovn_const.TYPE_SECURITY_GROUPS)
