@@ -35,5 +35,59 @@ log_driver_opts = [
 ]
 
 
+# These options are only consumed by the ML2/OVN logging driver running in the
+# Neutron server. They are registered separately from ``log_driver_opts``
+# because the agents that register those options do not use them.
+ovn_acl_sampling_opts = [
+    cfg.BoolOpt(
+        'ovn_acl_sampling',
+        default=False,
+        help=_('Allow network logs with the "flow_sample" output on the '
+               'ML2/OVN logging driver. When enabled, Neutron manages the '
+               'OVN Northbound Sampling_App rows of type "acl-new" and '
+               '"acl-est" and one Sample_Collector, using the identifiers '
+               'below, and attaches OVN Samples to the ACLs of the '
+               'selected security groups. The identifiers and the '
+               'probability have no defaults and must be set explicitly. '
+               'The OVS Flow_Sample_Collector_Set and IPFIX exporter on '
+               'each chassis are configured by the operator.')),
+    cfg.IntOpt(
+        'ovn_acl_sampling_app_new_id',
+        min=1, max=255,
+        help=_('ID of the OVN Sampling_App row of type "acl-new" that '
+               'Neutron creates and owns. Required when '
+               '"ovn_acl_sampling" is enabled.')),
+    cfg.IntOpt(
+        'ovn_acl_sampling_app_est_id',
+        min=1, max=255,
+        help=_('ID of the OVN Sampling_App row of type "acl-est" that '
+               'Neutron creates and owns. It must differ from '
+               '"ovn_acl_sampling_app_new_id". Required when '
+               '"ovn_acl_sampling" is enabled.')),
+    cfg.IntOpt(
+        'ovn_acl_sampling_collector_id',
+        min=1, max=255,
+        help=_('ID of the OVN Sample_Collector row that Neutron creates and '
+               'owns. Required when "ovn_acl_sampling" is enabled.')),
+    cfg.IntOpt(
+        'ovn_acl_sampling_collector_set_id',
+        min=1, max=4294967295,
+        help=_('OVS Flow_Sample_Collector_Set ID referenced by the Neutron '
+               'Sample_Collector. Required when "ovn_acl_sampling" is '
+               'enabled.')),
+    cfg.IntOpt(
+        'ovn_acl_sampling_probability',
+        min=1, max=65535,
+        help=_('Sampling probability of the Neutron Sample_Collector, '
+               'expressed as N/65535. It applies to all sampled ACLs and '
+               'connection stages. Required when "ovn_acl_sampling" is '
+               'enabled.')),
+]
+
+
 def register_log_driver_opts(cfg=cfg.CONF):
     cfg.register_opts(log_driver_opts, 'network_log')
+
+
+def register_ovn_acl_sampling_opts(cfg=cfg.CONF):
+    cfg.register_opts(ovn_acl_sampling_opts, 'network_log')

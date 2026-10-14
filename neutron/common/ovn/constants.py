@@ -121,6 +121,17 @@ ACL_ACTION_ALLOW_RELATED = 'allow-related'
 ACL_ACTION_ALLOW_STATELESS = 'allow-stateless'
 ACL_ACTION_ALLOW = 'allow'
 
+# OVN ACL sampling managed by the network log "flow_sample" output. Neutron
+# owns one Sampling_App row per ACL sampling stage and one Sample_Collector.
+# OVN Sample rows have no external_ids column, so the ownership of an ACL
+# sample reference is recorded on the ACL together with the expected Sample
+# metadata of each stage.
+OVN_SAMPLING_APP_ACL_NEW = 'acl-new'
+OVN_SAMPLING_APP_ACL_EST = 'acl-est'
+OVN_SAMPLE_COLLECTOR_NAME = 'neutron-network-log'
+OVN_ACL_SAMPLE_NEW_EXT_ID_KEY = 'neutron:sample_new_metadata'
+OVN_ACL_SAMPLE_EST_EXT_ID_KEY = 'neutron:sample_est_metadata'
+
 # NOTE(lucasagomes): These options were last synced from
 # https://github.com/ovn-org/ovn/blob/feb5d6e81d5a0290aa3618a229c860d01200422e/lib/ovn-l7.h
 #
