@@ -21,6 +21,7 @@ from ovsdbapp.backend.ovs_idl import idlutils
 
 from neutron.common.ovn import constants as ovn_const
 from neutron.common.ovn import exceptions as ovn_exc
+from neutron.common.ovn import sampling
 from neutron.plugins.ml2.drivers.ovn.mech_driver.ovsdb import commands
 from neutron.tests import base
 from neutron.tests.unit import fake_resources as fakes
@@ -1430,3 +1431,376 @@ class TestScheduleUnhostedGatewaysCommand(TestBaseCommand):
                                          reverse=True)
                         ch_name = [ch for ch, _ in ch_prio]
                         self.assertEqual(expected_mapping[g_name], ch_name)
+
+
+class _SamplingRow:
+    """Minimal IDL row: unset columns raise AttributeError like new rows."""
+
+    def __init__(self, **columns):
+        self.uuid = uuid.uuid4()
+        self.verified = set()
+        for col, value in columns.items():
+            setattr(self, col, value)
+
+    def verify(self, column):
+        self.verified.add(column)
+
+    def setkey(self, column, key, value):
+        # Like the IDL, setting a key also works on a column of a new row.
+        if not hasattr(self, column):
+            setattr(self, column, {})
+        getattr(self, column)[key] = value
+
+    def delkey(self, column, key):
+        getattr(self, column).pop(key, None)
+
+
+class _SamplingTable:
+    def __init__(self):
+        self.rows = {}
+
+    def add(self, row):
+        self.rows[row.uuid] = row
+        return row
+
+
+class _SamplingNb:
+    def __init__(self):
+        self.tables = {name: _SamplingTable() for name in (
+            'Sampling_App', 'Sample_Collector', 'Sample', 'Port_Group')}
+
+    def lookup(self, table, name):
+        for row in self.tables[table].rows.values():
+            if row.name == name:
+                return row
+        raise idlutils.RowNotFound(table=table, col='name', match=name)
+
+
+class _SamplingTxn:
+    def __init__(self, nb):
+        self.nb = nb
+        self.inserted = []
+
+    def insert(self, table):
+        row = table.add(_SamplingRow())
+        self.inserted.append(row)
+        return row
+
+
+class TestSamplingCommandBase(base.BaseTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.nb = _SamplingNb()
+        self.txn = _SamplingTxn(self.nb)
+        self.config = sampling.SamplingConfig(
+            app_new_id=11, app_est_id=12, collector_id=13,
+            collector_set_id=1000, probability=65535)
+
+    def _add(self, table, **columns):
+        return self.nb.tables[table].add(_SamplingRow(**columns))
+
+    def _rows(self, table):
+        return list(self.nb.tables[table].rows.values())
+
+    def _owned_collector(self, collector_id=13):
+        return self._add('Sample_Collector', id=collector_id,
+                         name=ovn_const.OVN_SAMPLE_COLLECTOR_NAME,
+                         probability=65535, set_id=1000,
+                         external_ids=sampling.owner_external_ids())
+
+
+class TestEnsureAclSamplingResourcesCommand(TestSamplingCommandBase):
+
+    def _run(self):
+        cmd = commands.EnsureAclSamplingResourcesCommand(self.nb, self.config)
+        cmd.run_idl(self.txn)
+        return cmd.result
+
+    def test_create(self):
+        result = self._run()
+        apps = {a.type: a for a in self._rows('Sampling_App')}
+        self.assertEqual({ovn_const.OVN_SAMPLING_APP_ACL_NEW: 11,
+                          ovn_const.OVN_SAMPLING_APP_ACL_EST: 12},
+                         {t: a.id for t, a in apps.items()})
+        for app in apps.values():
+            self.assertTrue(sampling.is_owned_row(app))
+        collector, = self._rows('Sample_Collector')
+        self.assertEqual(collector.uuid, result)
+        self.assertEqual((13, 65535, 1000),
+                         (collector.id, collector.probability,
+                          collector.set_id))
+        self.assertEqual(ovn_const.OVN_SAMPLE_COLLECTOR_NAME, collector.name)
+        self.assertTrue(sampling.is_owned_row(collector))
+
+    def test_idempotent(self):
+        self._run()
+        self.txn.inserted = []
+        result = self._run()
+        self.assertEqual([], self.txn.inserted)
+        self.assertEqual(self._rows('Sample_Collector')[0].uuid, result)
+
+    def test_update_owned_rows_in_place(self):
+        app = self._add('Sampling_App', type='acl-new', id=99,
+                        external_ids=sampling.owner_external_ids())
+        collector = self._owned_collector(collector_id=50)
+        collector.probability = 10
+        self.assertEqual(collector.uuid, self._run())
+        self.assertEqual(11, app.id)
+        self.assertEqual((13, 65535), (collector.id, collector.probability))
+        self.assertIn('id', app.verified)
+        self.assertEqual(1, len(self._rows('Sample_Collector')))
+
+    def test_foreign_app_type(self):
+        self._add('Sampling_App', type='acl-new', id=11, external_ids={})
+        self.assertRaises(ovn_exc.OVNSamplingResourceConflict, self._run)
+
+    def test_foreign_app_id(self):
+        self._add('Sampling_App', type='drop', id=12, external_ids={})
+        self.assertRaises(ovn_exc.OVNSamplingResourceConflict, self._run)
+
+    def test_swap_owned_app_ids(self):
+        new = self._add('Sampling_App', type='acl-new', id=12,
+                        external_ids=sampling.owner_external_ids())
+        est = self._add('Sampling_App', type='acl-est', id=11,
+                        external_ids=sampling.owner_external_ids())
+        self._run()
+        self.assertEqual((11, 12), (new.id, est.id))
+
+    def test_extra_owned_collectors_are_reported(self):
+        first = self._owned_collector()
+        extra = self._owned_collector(collector_id=14)
+        with mock.patch.object(commands.LOG, 'warning') as warn:
+            self.assertEqual(first.uuid, self._run())
+        warn.assert_called_once()
+        self.assertEqual([extra.uuid], warn.call_args[0][1]['extra'])
+        self.assertIn('external_ids', extra.verified)
+
+    def test_foreign_collector_id(self):
+        self._add('Sample_Collector', id=13, name='other', probability=1,
+                  set_id=1, external_ids={})
+        self.assertRaises(ovn_exc.OVNSamplingResourceConflict, self._run)
+
+
+class TestSetPortGroupAclSamplingCommand(TestSamplingCommandBase):
+
+    def setUp(self):
+        super().setUp()
+        self.collector = self._owned_collector()
+        self.pg = self._add('Port_Group', name='pg_sg1', acls=[])
+
+    def _acl(self, action, log=False, label=0, **columns):
+        acl = _SamplingRow(action=action, log=log, label=label,
+                           sample_new=[], sample_est=[], external_ids={},
+                           **columns)
+        self.pg.acls.append(acl)
+        return acl
+
+    def _run(self, actions, collector_id=13, port_group='pg_sg1'):
+        cmd = commands.SetPortGroupAclSamplingCommand(
+            self.nb, port_group, actions, collector_id)
+        cmd.run_idl(self.txn)
+        return cmd.result
+
+    def _sample(self, refs):
+        # References are rows before the command runs and UUIDs after it.
+        if not refs:
+            return None
+        ref, = refs
+        if isinstance(ref, _SamplingRow):
+            return ref
+        return self.nb.tables['Sample'].rows[ref]
+
+    def _md(self, acl, stage):
+        sample = self._sample(getattr(acl, sampling.STAGE_ACL_COLUMN[stage]))
+        return sample.metadata if sample else None
+
+    def _make_owned(self, acl, stage, sample):
+        setattr(acl, sampling.STAGE_ACL_COLUMN[stage], [sample])
+        acl.external_ids[sampling.STAGE_ACL_EXT_ID_KEY[stage]] = str(
+            sample.metadata)
+
+    def _owned_sample(self, metadata):
+        return self._add('Sample', metadata=metadata,
+                         collectors=[self.collector])
+
+    def _commit(self):
+        # Replace the UUID references set by the command with rows, as the
+        # IDL does after the transaction commits.
+        for acl in self.pg.acls:
+            for stage in sampling.STAGES:
+                column = sampling.STAGE_ACL_COLUMN[stage]
+                refs = getattr(acl, column)
+                rows = self.nb.tables['Sample'].rows
+                setattr(acl, column, [rows.get(r, r) for r in refs])
+        for sample in self._rows('Sample'):
+            sample.collectors = [
+                self.nb.tables['Sample_Collector'].rows.get(c, c)
+                for c in sample.collectors]
+
+    def test_all_events_stateful(self):
+        rule1 = self._acl(ovn_const.ACL_ACTION_ALLOW_RELATED)
+        rule2 = self._acl(ovn_const.ACL_ACTION_ALLOW_RELATED)
+        drop = self._acl(ovn_const.ACL_ACTION_DROP)
+        result = self._run({ovn_const.ACL_ACTION_ALLOW_RELATED,
+                            ovn_const.ACL_ACTION_DROP})
+        self.assertEqual({'conflicts': [], 'attached': 5, 'detached': 0},
+                         result)
+        # One Sample per stage and observation action, shared by the ACLs.
+        self.assertEqual(3, len(self._rows('Sample')))
+        self.assertEqual(self._md(rule1, 'new'), self._md(rule2, 'new'))
+        self.assertEqual(self._md(rule1, 'est'), self._md(rule2, 'est'))
+        self.assertEqual(3, len({self._md(rule1, 'new'),
+                                 self._md(rule1, 'est'),
+                                 self._md(drop, 'new')}))
+        self.assertIsNone(self._md(drop, 'est'))
+        self.assertEqual(
+            str(self._md(rule1, 'new')),
+            rule1.external_ids[ovn_const.OVN_ACL_SAMPLE_NEW_EXT_ID_KEY])
+        for sample in self._rows('Sample'):
+            self.assertEqual([self.collector.uuid], sample.collectors)
+        self.assertIn('acls', self.pg.verified)
+        self.assertIn('sample_new', rule1.verified)
+
+    def test_stateless_and_accept_only(self):
+        rule = self._acl(ovn_const.ACL_ACTION_ALLOW_STATELESS)
+        drop = self._acl(ovn_const.ACL_ACTION_DROP)
+        self._run({ovn_const.ACL_ACTION_ALLOW_STATELESS})
+        self.assertIsNotNone(self._md(rule, 'new'))
+        self.assertIsNone(self._md(rule, 'est'))
+        self.assertIsNone(self._md(drop, 'new'))
+        self.assertEqual(1, len(self._rows('Sample')))
+
+    def test_repeated_run_keeps_identity(self):
+        rule = self._acl(ovn_const.ACL_ACTION_ALLOW_RELATED)
+        actions = {ovn_const.ACL_ACTION_ALLOW_RELATED}
+        self._run(actions)
+        self._commit()
+        before = (self._md(rule, 'new'), self._md(rule, 'est'))
+        self.txn.inserted = []
+        result = self._run(actions)
+        self.assertEqual(0, result['attached'])
+        self.assertEqual([], self.txn.inserted)
+        self.assertEqual(before, (self._md(rule, 'new'),
+                                  self._md(rule, 'est')))
+
+    def test_new_acl_reuses_existing_sample(self):
+        rule1 = self._acl(ovn_const.ACL_ACTION_ALLOW_RELATED)
+        sample = self._owned_sample(1234)
+        self._make_owned(rule1, 'new', sample)
+        rule2 = self._acl(ovn_const.ACL_ACTION_ALLOW_STATELESS)
+        self._run({ovn_const.ACL_ACTION_ALLOW_STATELESS,
+                   ovn_const.ACL_ACTION_ALLOW_RELATED})
+        self.assertEqual(1234, self._md(rule2, 'new'))
+        # The est stage of rule1 was missing and gets a new Sample.
+        self.assertEqual(2, len(self._rows('Sample')))
+
+    def test_converge_to_most_common_metadata(self):
+        acls = [self._acl(ovn_const.ACL_ACTION_ALLOW_STATELESS)
+                for _ in range(3)]
+        common = self._owned_sample(20)
+        other = self._owned_sample(10)
+        self._make_owned(acls[0], 'new', common)
+        self._make_owned(acls[1], 'new', common)
+        self._make_owned(acls[2], 'new', other)
+        result = self._run({ovn_const.ACL_ACTION_ALLOW_STATELESS})
+        self.assertEqual(1, result['attached'])
+        self.assertEqual([20, 20, 20], [self._md(a, 'new') for a in acls])
+
+    def test_detach(self):
+        rule = self._acl(ovn_const.ACL_ACTION_ALLOW_RELATED)
+        new = self._owned_sample(1)
+        est = self._owned_sample(2)
+        self._make_owned(rule, 'new', new)
+        self._make_owned(rule, 'est', est)
+        result = self._run(set(), collector_id=None)
+        self.assertEqual({'conflicts': [], 'attached': 0, 'detached': 2},
+                         result)
+        self.assertEqual(([], []), (rule.sample_new, rule.sample_est))
+        self.assertEqual({}, rule.external_ids)
+        # The ownership decision is guarded against concurrent changes.
+        for sample in (new, est):
+            self.assertEqual({'metadata', 'collectors'}, sample.verified)
+        self.assertIn('external_ids', self.collector.verified)
+
+    def test_detach_only_actions_no_longer_requested(self):
+        rule = self._acl(ovn_const.ACL_ACTION_ALLOW_STATELESS)
+        drop = self._acl(ovn_const.ACL_ACTION_DROP)
+        self._make_owned(rule, 'new', self._owned_sample(1))
+        self._make_owned(drop, 'new', self._owned_sample(2))
+        self._run({ovn_const.ACL_ACTION_ALLOW_STATELESS})
+        self.assertEqual(1, self._md(rule, 'new'))
+        self.assertEqual([], drop.sample_new)
+
+    def test_foreign_reference_left_unchanged(self):
+        rule = self._acl(ovn_const.ACL_ACTION_ALLOW_STATELESS)
+        foreign = self._add('Sample', metadata=77,
+                            collectors=[self.collector])
+        rule.sample_new = [foreign]
+        result = self._run(set(), collector_id=None)
+        self.assertEqual([(rule.uuid, 'new')], result['conflicts'])
+        self.assertEqual([foreign], rule.sample_new)
+        result = self._run({ovn_const.ACL_ACTION_ALLOW_STATELESS})
+        self.assertEqual([(rule.uuid, 'new')], result['conflicts'])
+        self.assertEqual([foreign], rule.sample_new)
+        self.assertNotIn(ovn_const.OVN_ACL_SAMPLE_NEW_EXT_ID_KEY,
+                         rule.external_ids)
+
+    def test_foreign_reference_raises_when_required(self):
+        rule = self._acl(ovn_const.ACL_ACTION_ALLOW_STATELESS)
+        stale = self._acl(ovn_const.ACL_ACTION_DROP)
+        foreign = self._add('Sample', metadata=77,
+                            collectors=[self.collector])
+        rule.sample_new = [foreign]
+        stale.sample_new = [foreign]
+        cmd = commands.SetPortGroupAclSamplingCommand(
+            self.nb, 'pg_sg1', {ovn_const.ACL_ACTION_ALLOW_STATELESS}, 13,
+            raise_on_conflict=True)
+        self.assertRaises(ovn_exc.OVNSamplingResourceConflict,
+                          cmd.run_idl, self.txn)
+        # A foreign reference on a stage that is not required is only
+        # reported.
+        cmd = commands.SetPortGroupAclSamplingCommand(
+            self.nb, 'pg_sg1', {ovn_const.ACL_ACTION_DROP}, 13,
+            raise_on_conflict=True)
+        self.assertRaises(ovn_exc.OVNSamplingResourceConflict,
+                          cmd.run_idl, self.txn)
+        stale.sample_new = []
+        cmd = commands.SetPortGroupAclSamplingCommand(
+            self.nb, 'pg_sg1', {ovn_const.ACL_ACTION_DROP}, 13,
+            raise_on_conflict=True)
+        cmd.run_idl(self.txn)
+        self.assertEqual([(rule.uuid, 'new')], cmd.result['conflicts'])
+        self.assertIsNotNone(self._md(stale, 'new'))
+
+    def test_stale_record_removed(self):
+        rule = self._acl(ovn_const.ACL_ACTION_ALLOW_STATELESS)
+        rule.external_ids[ovn_const.OVN_ACL_SAMPLE_NEW_EXT_ID_KEY] = '5'
+        self._run(set(), collector_id=None)
+        self.assertEqual({}, rule.external_ids)
+
+    def test_label_of_logged_acl(self):
+        logged = self._acl(ovn_const.ACL_ACTION_ALLOW_STATELESS, log=True,
+                           label=99)
+        unlogged = self._acl(ovn_const.ACL_ACTION_ALLOW_STATELESS)
+        self._run({ovn_const.ACL_ACTION_ALLOW_STATELESS})
+        self.assertEqual(self._md(logged, 'new'), logged.label)
+        self.assertEqual(0, unlogged.label)
+
+    def test_acl_inserted_in_transaction(self):
+        # Rows inserted earlier in the transaction have unset columns.
+        acl = _SamplingRow(action=ovn_const.ACL_ACTION_DROP)
+        self.pg.acls.append(acl)
+        self._run({ovn_const.ACL_ACTION_DROP})
+        self.assertIsNotNone(self._md(acl, 'new'))
+
+    def test_missing_collector(self):
+        self._acl(ovn_const.ACL_ACTION_DROP)
+        self.assertRaises(RuntimeError, self._run,
+                          {ovn_const.ACL_ACTION_DROP}, collector_id=99)
+
+    def test_missing_port_group(self):
+        result = self._run({ovn_const.ACL_ACTION_DROP},
+                           port_group='missing')
+        self.assertEqual({'conflicts': [], 'attached': 0, 'detached': 0},
+                         result)

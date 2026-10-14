@@ -550,6 +550,16 @@ class OvsdbNbOvnIdl(nb_impl_idl.OvnNbApiIdlImpl, Backend):
         """Removes an ACL register matching the security group rule ID"""
         return cmd.DelACLBySGruleIDCommand(self, sg_id, sg_rule_id, if_exists)
 
+    def ensure_acl_sampling_resources(self, config):
+        return cmd.EnsureAclSamplingResourcesCommand(self, config)
+
+    def set_port_group_acl_sampling(self, port_group, acl_actions,
+                                    collector_id, if_exists=True,
+                                    raise_on_conflict=False):
+        return cmd.SetPortGroupAclSamplingCommand(
+            self, port_group, acl_actions, collector_id, if_exists=if_exists,
+            raise_on_conflict=raise_on_conflict)
+
     def add_static_route(self, lrouter, maintain_bfd=False, **columns):
         return cmd.AddStaticRouteCommand(self, lrouter, maintain_bfd,
                                          **columns)

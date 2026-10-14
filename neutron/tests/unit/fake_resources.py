@@ -134,6 +134,8 @@ class FakeOvsdbNbOvnIdl:
         self.delete_lrouter_ext_gw.return_value = None
         self.pg_acl_add = mock.Mock()
         self.pg_acl_del = mock.Mock()
+        self.ensure_acl_sampling_resources = mock.Mock()
+        self.set_port_group_acl_sampling = mock.Mock()
         self.pg_del = mock.Mock()
         self.pg_add = mock.Mock()
         self.pg_get = mock.Mock()

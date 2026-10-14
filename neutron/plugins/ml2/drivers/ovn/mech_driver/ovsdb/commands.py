@@ -13,6 +13,7 @@
 #    under the License.
 
 import abc
+import collections
 import copy
 import uuid
 
@@ -27,6 +28,7 @@ from ovsdbapp import utils as ovsdbapp_utils
 from neutron._i18n import _
 from neutron.common.ovn import constants as ovn_const
 from neutron.common.ovn import exceptions as ovn_exc
+from neutron.common.ovn import sampling
 from neutron.common.ovn import utils
 from neutron.services.portforwarding.constants import PORT_FORWARDING_PREFIX
 
@@ -1312,3 +1314,242 @@ class HAChassisGroupWithHCAddCommand(command.AddCommand):
             txn, self.api, self.name, self.chassis_priority,
             may_exist=self.may_exist, table_name=self.table_name,
             **self.columns)
+
+
+class EnsureAclSamplingResourcesCommand(command.BaseCommand):
+    """Create or update the sampling rows owned by Neutron.
+
+    Neutron owns the ``acl-new`` and ``acl-est`` Sampling_App rows and one
+    Sample_Collector. A row with the same application type or collector ID
+    that is not marked as owned by Neutron is never adopted or modified.
+    The result is the UUID of the Neutron Sample_Collector row.
+    """
+
+    def __init__(self, api, config):
+        super().__init__(api)
+        self.config = config
+
+    def _ensure_app(self, txn, apps, app_type, app_id, wanted_types):
+        for app in apps:
+            app.verify('external_ids')
+        row = next((app for app in apps if app.type == app_type), None)
+        if row is not None and not sampling.is_owned_row(row):
+            raise ovn_exc.OVNSamplingResourceConflict(
+                resource='Sampling_App %s' % app_type,
+                reason='the application type already exists')
+        for other in apps:
+            if other is row or other.id != app_id:
+                continue
+            if other.type in wanted_types and sampling.is_owned_row(other):
+                # Another owned row that will be updated in this command.
+                continue
+            raise ovn_exc.OVNSamplingResourceConflict(
+                resource='Sampling_App %s' % app_type,
+                reason='application ID %d is used by type %s' % (
+                    app_id, other.type))
+        if row is None:
+            row = txn.insert(self.api.tables['Sampling_App'])
+            row.type = app_type
+            row.id = app_id
+            row.external_ids = sampling.owner_external_ids()
+            return
+        row.verify('id')
+        if row.id != app_id:
+            row.id = app_id
+
+    def _ensure_collector(self, txn, collectors):
+        cfg = self.config
+        for collector in collectors:
+            collector.verify('external_ids')
+        owned = [c for c in collectors if sampling.is_owned_row(c)]
+        if len(owned) > 1:
+            LOG.warning("Several Sample_Collector rows are owned by Neutron; "
+                        "only %(kept)s is managed, remove the others: "
+                        "%(extra)s",
+                        {'kept': owned[0].uuid,
+                         'extra': [c.uuid for c in owned[1:]]})
+        for other in collectors:
+            if other.id == cfg.collector_id and other not in owned:
+                raise ovn_exc.OVNSamplingResourceConflict(
+                    resource='Sample_Collector %d' % cfg.collector_id,
+                    reason='the collector ID is used by another row')
+        # Prefer the owned row that already has the configured ID. If the
+        # configured ID changed, the existing owned row is updated in place
+        # so that the Samples referencing it keep working.
+        owned.sort(key=lambda c: c.id != cfg.collector_id)
+        if owned:
+            row = owned[0]
+            for col in ('id', 'probability', 'set_id', 'name'):
+                row.verify(col)
+        else:
+            row = txn.insert(self.api.tables['Sample_Collector'])
+            row.external_ids = sampling.owner_external_ids()
+        columns = {'id': cfg.collector_id,
+                   'probability': cfg.probability,
+                   'set_id': cfg.collector_set_id,
+                   'name': ovn_const.OVN_SAMPLE_COLLECTOR_NAME}
+        for col, value in columns.items():
+            if not owned or getattr(row, col) != value:
+                setattr(row, col, value)
+        return row
+
+    def run_idl(self, txn):
+        cfg = self.config
+        wanted = {ovn_const.OVN_SAMPLING_APP_ACL_NEW: cfg.app_new_id,
+                  ovn_const.OVN_SAMPLING_APP_ACL_EST: cfg.app_est_id}
+        apps = list(self.api.tables['Sampling_App'].rows.values())
+        for app_type, app_id in wanted.items():
+            self._ensure_app(txn, apps, app_type, app_id, wanted)
+        collectors = list(self.api.tables['Sample_Collector'].rows.values())
+        self.result = self._ensure_collector(txn, collectors).uuid
+
+
+class SetPortGroupAclSamplingCommand(command.BaseCommand):
+    """Converge the Neutron sample references of a Port Group's ACLs.
+
+    ACLs whose action is in ``acl_actions`` reference the Neutron Sample of
+    their security group, connection stage and observation action. All other
+    Neutron references of the Port Group are removed. References that
+    Neutron did not record are left unchanged and reported as conflicts;
+    with ``raise_on_conflict`` a conflict on a stage that must be attached
+    aborts the transaction with ``OVNSamplingResourceConflict``.
+
+    The plan is computed from the rows seen inside the transaction, so ACLs
+    added or removed earlier in the same transaction are taken into account
+    and a concurrent change makes the IDL retry the whole command.
+
+    The result is a dict with the ``conflicts`` (a list of ``(acl_uuid,
+    stage)``), ``attached`` and ``detached`` counters.
+    """
+
+    def __init__(self, api, port_group, acl_actions, collector_id,
+                 if_exists=True, raise_on_conflict=False):
+        super().__init__(api)
+        self.port_group = port_group
+        self.acl_actions = frozenset(acl_actions or ())
+        self.collector_id = collector_id
+        self.if_exists = if_exists
+        self.raise_on_conflict = raise_on_conflict
+
+    def _owned_collectors(self):
+        owned = [c for c in self.api.tables['Sample_Collector'].rows.values()
+                 if sampling.is_owned_row(c)]
+        # Attaching and detaching references depends on the ownership of
+        # these collectors; fail the transaction if it changes.
+        for collector in owned:
+            collector.verify('external_ids')
+        target = None
+        if self.acl_actions:
+            target = next((c for c in owned if c.id == self.collector_id),
+                          None)
+            if target is None:
+                raise RuntimeError(
+                    _('Neutron Sample_Collector %s does not exist') %
+                    self.collector_id)
+        return {c.uuid for c in owned}, target
+
+    def _wanted_stages(self, acl):
+        if acl.action not in self.acl_actions:
+            return ()
+        if sampling.observation_action(acl.action) is None:
+            return ()
+        return sampling.stages_for_acl_action(acl.action)
+
+    def run_idl(self, txn):
+        try:
+            pg = self.api.lookup('Port_Group', self.port_group)
+        except idlutils.RowNotFound:
+            if self.if_exists:
+                self.result = {'conflicts': [], 'attached': 0, 'detached': 0}
+                return
+            raise RuntimeError(
+                _('Port Group %s does not exist') % self.port_group)
+        owned_uuids, target = self._owned_collectors()
+        pg.verify('acls')
+
+        samples_by_md = {}
+        for sample in self.api.tables['Sample'].rows.values():
+            md = sampling.sample_metadata(sample)
+            if md is not None:
+                samples_by_md[md] = sample
+
+        plan = []
+        conflicts = []
+        candidates = collections.defaultdict(list)
+        for acl in pg.acls:
+            wanted = self._wanted_stages(acl)
+            identity_action = sampling.observation_action(acl.action)
+            for stage in sampling.STAGES:
+                state = sampling.classify_attachment(acl, stage, owned_uuids)
+                want = stage in wanted
+                if state == sampling.ATTACHMENT_FOREIGN:
+                    if want and self.raise_on_conflict:
+                        raise ovn_exc.OVNSamplingResourceConflict(
+                            resource='ACL %s %s' % (
+                                acl.uuid, sampling.STAGE_ACL_COLUMN[stage]),
+                            reason='the ACL references a Sample that '
+                                   'Neutron does not manage')
+                    conflicts.append((acl.uuid, stage))
+                    continue
+                if state == sampling.ATTACHMENT_OWNED:
+                    # The decision depends on the Sample's metadata and
+                    # collectors; fail the transaction if they change.
+                    sample = sampling.referenced_sample(acl, stage)
+                    sample.verify('metadata')
+                    sample.verify('collectors')
+                    if want and sampling.sample_collector_uuids(sample) == [
+                            target.uuid]:
+                        candidates[(identity_action, stage)].append(
+                            sampling.sample_metadata(sample))
+                plan.append((acl, stage, state, want, identity_action))
+
+        identity_md = {}
+        for _acl, stage, _state, want, identity_action in plan:
+            identity = (identity_action, stage)
+            if not want or identity in identity_md:
+                continue
+            md = sampling.choose_metadata(candidates.get(identity))
+            if md is None:
+                md = sampling.allocate_metadata(samples_by_md)
+                sample = txn.insert(self.api.tables['Sample'])
+                sample.metadata = md
+                sample.collectors = [target.uuid]
+                samples_by_md[md] = sample
+            identity_md[identity] = md
+
+        attached = detached = 0
+        new_stage_md = {}
+        for acl, stage, state, want, identity_action in plan:
+            column = sampling.STAGE_ACL_COLUMN[stage]
+            key = sampling.STAGE_ACL_EXT_ID_KEY[stage]
+            recorded = sampling.recorded_metadata(acl, stage)
+            if want:
+                md = identity_md[(identity_action, stage)]
+                if stage == sampling.STAGE_NEW:
+                    new_stage_md[acl.uuid] = (acl, md)
+                if state == sampling.ATTACHMENT_OWNED and recorded == md:
+                    continue
+                acl.verify(column)
+                acl.verify('external_ids')
+                setattr(acl, column, [samples_by_md[md].uuid])
+                acl.setkey('external_ids', key, str(md))
+                attached += 1
+                continue
+            if state == sampling.ATTACHMENT_OWNED:
+                acl.verify(column)
+                setattr(acl, column, [])
+                detached += 1
+            if key in getattr(acl, 'external_ids', {}):
+                acl.verify('external_ids')
+                acl.delkey('external_ids', key)
+
+        # A nonzero ACL label takes precedence over the Sample metadata as
+        # the emitted observation point. Packet logging needs a nonzero
+        # label, so keep the emitted value stable by using the new-stage
+        # metadata as the label of logged ACLs that are also sampled.
+        for acl, md in new_stage_md.values():
+            if getattr(acl, 'log', False) and getattr(acl, 'label', 0) != md:
+                acl.label = md
+
+        self.result = {'conflicts': conflicts, 'attached': attached,
+                       'detached': detached}
