@@ -12,6 +12,9 @@
 
 from oslo_utils import uuidutils
 
+from neutron_lib.api.definitions import logging_output_type as output_apidef
+from oslo_versionedobjects import exception as obj_exception
+
 from neutron.objects.logapi import logging_resource as log_res
 from neutron.objects import securitygroup
 from neutron.tests.unit.objects import test_base
@@ -21,6 +24,23 @@ from neutron.tests.unit import testlib_api
 class LogObjectTestCase(test_base.BaseObjectIfaceTestCase):
 
     _test_class = log_res.Log
+
+    def test_object_version_degradation_1_1_to_1_0_packet_log(self):
+        log_obj = self._test_class(
+            self.context, id=uuidutils.generate_uuid(),
+            resource_type='security_group',
+            output_type=output_apidef.PACKET_LOG)
+        primitive = log_obj.obj_to_primitive(target_version='1.0')
+        self.assertNotIn('output_type',
+                         primitive['versioned_object.data'])
+
+    def test_object_version_degradation_1_1_to_1_0_flow_sample(self):
+        log_obj = self._test_class(
+            self.context, id=uuidutils.generate_uuid(),
+            resource_type='security_group',
+            output_type=output_apidef.FLOW_SAMPLE)
+        self.assertRaises(obj_exception.IncompatibleObjectVersion,
+                          log_obj.obj_to_primitive, target_version='1.0')
 
 
 class LogDBObjectTestCase(test_base.BaseDbObjectTestCase,

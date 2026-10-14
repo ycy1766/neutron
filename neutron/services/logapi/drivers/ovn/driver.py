@@ -14,6 +14,7 @@ import collections
 from collections import namedtuple
 import secrets
 
+from neutron_lib.api.definitions import logging_output_type as output_apidef
 from neutron_lib.api.definitions import portbindings
 from neutron_lib.callbacks import resources
 from neutron_lib import exceptions as n_exceptions
@@ -33,7 +34,9 @@ from neutron.common.ovn import utils
 from neutron.conf.services import logging as log_cfg
 from neutron.objects import securitygroup as sg_obj
 from neutron.services.logapi.common import db_api
+from neutron.services.logapi.common import exceptions as log_exc
 from neutron.services.logapi.common import sg_callback
+from neutron.services.logapi.common import validators
 from neutron.services.logapi.drivers import base
 from neutron.services.logapi.drivers import manager
 
@@ -47,16 +50,11 @@ log_cfg.register_ovn_acl_sampling_opts()
 MAX_INT_LABEL = 2**32
 SUPPORTED_LOGGING_TYPES = (log_const.SECURITY_GROUP,)
 
-# TODO(ycy1766): Use the neutron-lib definitions once the
-# "logging-output-type" API extension is available.
-OUTPUT_PACKET_LOG = 'packet_log'
-OUTPUT_FLOW_SAMPLE = 'flow_sample'
+OUTPUT_PACKET_LOG = output_apidef.PACKET_LOG
+OUTPUT_FLOW_SAMPLE = output_apidef.FLOW_SAMPLE
 DROP_LOG_EVENTS = (log_const.DROP_EVENT, log_const.ALL_EVENT)
 
-
-def log_output_type(log_obj):
-    """Return the output of a log object, defaulting to packet logging."""
-    return getattr(log_obj, 'output_type', None) or OUTPUT_PACKET_LOG
+log_output_type = validators.get_log_output_type
 
 
 def is_flow_sample_log(log_obj):
@@ -72,12 +70,6 @@ class FlowSamplingNotAvailable(n_exceptions.InvalidInput):
     message = _("OVN ACL sampling is not enabled in the Neutron "
                 "configuration or not supported by the OVN Northbound "
                 "database.")
-
-
-class FlowSampleSelectorNotSupported(n_exceptions.InvalidInput):
-    message = _("A network log with the flow_sample output must select a "
-                "security group with resource_id and must not set "
-                "target_id.")
 
 
 class OVNDriver(base.DriverBase):
@@ -98,6 +90,15 @@ class OVNDriver(base.DriverBase):
     def create(cls, plugin_driver):
         cls.plugin_driver = plugin_driver
         return OVNDriver()
+
+    @property
+    def supported_output_types(self):
+        """Advertise flow sampling only when it can be applied."""
+        output_types = [OUTPUT_PACKET_LOG]
+        if (self._get_sampling_config() is not None and
+                self._sampling_schema_supported()):
+            output_types.append(OUTPUT_FLOW_SAMPLE)
+        return tuple(output_types)
 
     @property
     def _log_plugin(self):
@@ -621,7 +622,7 @@ class OVNDriver(base.DriverBase):
         server without that validation.
         """
         if not log_obj.resource_id or log_obj.target_id:
-            raise FlowSampleSelectorNotSupported()
+            raise log_exc.FlowSampleSelectorNotSupported()
         self._check_flow_sampling_available()
 
     def sync_security_group_sampling(self, context, sg_id, txn):

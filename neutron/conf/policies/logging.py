@@ -60,6 +60,23 @@ rules = [
             deprecated_since=versionutils.deprecated.WALLABY)
     ),
     policy.DocumentedRuleDefault(
+        name='create_log:output_type',
+        check_str=lib_rules.ADMIN,
+        scope_types=['project'],
+        description=('Create a network log with an output type other than '
+                     'packet_log, or enable such a log'),
+        operations=[
+            {
+                'method': 'POST',
+                'path': COLLECTION_PATH,
+            },
+            {
+                'method': 'PUT',
+                'path': RESOURCE_PATH,
+            },
+        ],
+    ),
+    policy.DocumentedRuleDefault(
         name='get_log',
         check_str=lib_rules.ADMIN_OR_PROJECT_MANAGER,
         scope_types=['project'],

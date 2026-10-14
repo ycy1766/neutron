@@ -13,6 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from neutron_lib.api.definitions import logging_output_type as output_apidef
 from neutron_lib.callbacks import events
 from neutron_lib.callbacks import registry
 from neutron_lib import exceptions
@@ -20,6 +21,7 @@ from neutron_lib.services.logapi import constants as log_const
 from oslo_log import log as logging
 
 from neutron.services.logapi.common import exceptions as log_exc
+from neutron.services.logapi.common import validators
 from neutron.services.logapi.rpc import server as server_rpc
 
 LOG = logging.getLogger(__name__)
@@ -42,6 +44,44 @@ def _get_param(args, kwargs, name, index):
         except IndexError:
             msg = "Missing parameter %s" % name
             raise log_exc.LogapiDriverException(exception_msg=msg)
+
+
+def _select_logs(log_objs, accept):
+    """Return the part of a driver call's log parameter that is accepted.
+
+    The parameter is either one log object or a list of them. None is
+    returned when nothing is accepted.
+    """
+    if isinstance(log_objs, (list, tuple)):
+        selected = [lo for lo in log_objs
+                    if accept(validators.get_log_output_type(lo))]
+        return selected if selected or not log_objs else None
+    if accept(validators.get_log_output_type(log_objs)):
+        return log_objs
+    return None
+
+
+def _call_params_for(accept, args, kwargs):
+    """Narrow the log parameter of a driver call to the accepted logs.
+
+    Returns the (args, kwargs) to use, or None when no log is accepted.
+    Calls without a log parameter are passed unchanged.
+    """
+    args = list(args)
+    kwargs = dict(kwargs)
+    for name in ('log_obj', 'log_objs'):
+        if name in kwargs:
+            selected = _select_logs(kwargs[name], accept)
+            if selected is None:
+                return None
+            kwargs[name] = selected
+            return args, kwargs
+    if len(args) > 1:
+        selected = _select_logs(args[1], accept)
+        if selected is None:
+            return None
+        args[1] = selected
+    return args, kwargs
 
 
 class ResourceCallBackBase:
@@ -113,12 +153,39 @@ class LoggingServiceDriverManager:
                   "by at least one loaded log_driver): %s", log_types)
         return log_types
 
+    def supported_output_types(self, log_type):
+        """Return the log output types usable for a logging type.
+
+        An output is advertised only when every loaded driver that supports
+        the logging type supports the output, so that a log of that output
+        can be applied by all of them.
+        """
+        output_types = None
+        for driver in self._drivers:
+            if log_type not in driver.supported_logging_types:
+                continue
+            driver_outputs = set(driver.supported_output_types)
+            if output_types is None:
+                output_types = driver_outputs
+            else:
+                output_types &= driver_outputs
+        return output_types or set()
+
     def call(self, method_name, *args, **kwargs):
-        """Helper method for calling a method across all extension drivers."""
+        """Helper method for calling a method across all extension drivers.
+
+        Each driver only receives the log objects whose output type it
+        supports, and only logs with the packet logging output are sent
+        to the agent RPC path.
+        """
         exc_list = []
         for driver in self._drivers:
+            params = _call_params_for(driver.is_output_type_supported,
+                                      args, kwargs)
+            if params is None:
+                continue
             try:
-                getattr(driver, method_name)(*args, **kwargs)
+                getattr(driver, method_name)(*params[0], **params[1])
             except Exception as exc:
                 exception_msg = ("Extension driver '%(name)s' failed in "
                                  "%(method)s")
@@ -132,6 +199,10 @@ class LoggingServiceDriverManager:
         if self.rpc_required:
             context = _get_param(args, kwargs, 'context', index=0)
             log_obj = _get_param(args, kwargs, 'log_obj', index=1)
+            log_obj = _select_logs(
+                log_obj, lambda ot: ot == output_apidef.PACKET_LOG)
+            if log_obj is None:
+                return
 
             try:
                 rpc_method = getattr(self.logging_rpc, method_name)

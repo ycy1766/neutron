@@ -64,7 +64,7 @@ object_data = {
     'LocalIPAssociation': '1.0-4febb23ad22f11a69c431b077b3aac21',
     'MeteringLabel': '1.0-cc4b620a3425222447cbe459f62de533',
     'MeteringLabelRule': '2.0-0ad09894c62e1ce6e868f725158959ba',
-    'Log': '1.0-6391351c0f34ed34375a19202f361d24',
+    'Log': '1.1-bfcf6eed50b0185a0b7343a6d51809a4',
     'NDPProxy': '1.0-a6597d9caac3bb0d63f943f82e4dda8c',
     'Network': '1.3-5adf26dc5bf678b90203e8349637d4c9',
     'NetworkDhcpAgentBinding': '1.1-d9443c88809ffa4c45a0a5a48134b54a',
