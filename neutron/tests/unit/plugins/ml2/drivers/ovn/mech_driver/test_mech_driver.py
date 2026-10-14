@@ -337,7 +337,10 @@ class TestOVNMechanismDriver(TestOVNMechanismDriverBase):
                                'get_security_group_rules',
                                return_value=[rule]), \
                 mock.patch.object(
-                    ovn_acl, 'update_acls_for_security_group') as ovn_acl_up:
+                    ovn_acl, 'update_acls_for_security_group') as ovn_acl_up, \
+                mock.patch.object(
+                    self.mech_driver.log_driver,
+                    'sync_security_group_sampling') as sync_sampling:
             self.mech_driver._update_security_group(
                 resources.SECURITY_GROUP, events.AFTER_UPDATE, {},
                 payload=events.DBEventPayload(
@@ -363,6 +366,10 @@ class TestOVNMechanismDriver(TestOVNMechanismDriverBase):
                 mock.call(mock.ANY, fake_sg_update,
                           ovn_const.TYPE_SECURITY_GROUPS),
             ])
+            # The replaced ACLs get their flow sampling reapplied in the
+            # same transaction.
+            sync_sampling.assert_called_once_with(
+                mock.ANY, self.fake_sg['id'], mock.ANY)
 
     def test__update_security_group_stateful(self):
         self._test__update_security_group(True)
