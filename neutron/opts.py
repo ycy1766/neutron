@@ -317,7 +317,9 @@ def list_ml2_conf_opts():
          ovs_driver_opts),
         ('sriov_driver',
          neutron.conf.plugins.ml2.drivers.mech_sriov.mech_sriov_conf.
-         sriov_driver_opts)
+         sriov_driver_opts),
+        ('network_log',
+         neutron.conf.services.logging.ovn_acl_sampling_opts),
     ]
 
 
