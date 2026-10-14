@@ -446,6 +446,10 @@ class OvnNbSynchronizer(db_sync_base.BaseOvnDbSynchronizer):
                         raise
                 break
 
+        if self.mode == n_lib_ovn_const.OVN_DB_SYNC_MODE_REPAIR:
+            # ACLs recreated above lost their sampling references.
+            self.ovn_log_driver.reconcile_sampling(ctx)
+
         LOG.debug('OVN-NB Sync ACLs completed @ %s', str(datetime.now()))
 
     @staticmethod

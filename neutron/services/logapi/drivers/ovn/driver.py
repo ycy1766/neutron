@@ -49,6 +49,9 @@ log_cfg.register_ovn_acl_sampling_opts()
 
 MAX_INT_LABEL = 2**32
 SUPPORTED_LOGGING_TYPES = (log_const.SECURITY_GROUP,)
+# Attempts of a sampling transaction when two servers allocate the same
+# Sample metadata at the same time.
+SAMPLING_TXN_ATTEMPTS = 3
 
 OUTPUT_PACKET_LOG = output_apidef.PACKET_LOG
 OUTPUT_FLOW_SAMPLE = output_apidef.FLOW_SAMPLE
@@ -625,6 +628,27 @@ class OVNDriver(base.DriverBase):
             raise log_exc.FlowSampleSelectorNotSupported()
         self._check_flow_sampling_available()
 
+    def reconcile_sampling(self, context, sg_ids=None):
+        """Converge the sampling of security groups with flow-sample logs.
+
+        Used by the maintenance task and the OVN DB sync tool to repair
+        references lost to ACL replacement, missed notifications or
+        failed transactions, and to detach the sampling of logs that
+        remain enabled after the operator disabled it.
+
+        :param sg_ids: the security groups to reconcile; all the security
+            groups selected by a flow-sample log if not given.
+        :returns: the list of reconciled security group IDs.
+        """
+        if sg_ids is None:
+            sg_ids = sorted({lo.resource_id for lo in
+                             self._get_flow_sample_logs(context)
+                             if lo.resource_id})
+        sg_ids = list(sg_ids)
+        if sg_ids:
+            self._sync_sg_sampling(context, sg_ids)
+        return sg_ids
+
     def sync_security_group_sampling(self, context, sg_id, txn):
         """Reapply the sampling of a security group whose ACLs changed.
 
@@ -737,8 +761,7 @@ class OVNDriver(base.DriverBase):
         if txn is not None:
             add_commands(txn)
             return
-        with self.ovn_nb.transaction(check_error=True) as ovn_txn:
-            set_cmds = add_commands(ovn_txn)
+        set_cmds = self._commit_sampling(add_commands)
 
         for sg_id, cmd in set_cmds.items():
             result = getattr(cmd, 'result', None)
@@ -747,6 +770,26 @@ class OVNDriver(base.DriverBase):
                             "that are not managed by Neutron and were left "
                             "unchanged: %(conflicts)s",
                             {'sg': sg_id, 'conflicts': result['conflicts']})
+
+    def _commit_sampling(self, add_commands):
+        """Commit sampling commands, retrying a Sample identifier race.
+
+        Sample metadata values are chosen from the rows visible to this
+        server. Another server can insert the same value first, which the
+        Northbound index rejects; the next attempt sees the new row.
+        """
+        for attempt in range(1, SAMPLING_TXN_ATTEMPTS + 1):
+            try:
+                with self.ovn_nb.transaction(check_error=True) as ovn_txn:
+                    result = add_commands(ovn_txn)
+                return result
+            except RuntimeError as exc:
+                if ('constraint violation' not in str(exc) or
+                        attempt == SAMPLING_TXN_ATTEMPTS):
+                    raise
+                LOG.info("Retrying OVN ACL sampling transaction after a "
+                         "constraint violation (attempt %d): %s",
+                         attempt, exc)
 
     def add_logging_options_to_acls(self, neutron_acls, context):
         log_objs = self._get_packet_logs(context)

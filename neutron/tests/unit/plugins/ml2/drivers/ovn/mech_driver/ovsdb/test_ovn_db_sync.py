@@ -712,8 +712,16 @@ class TestOvnNbSyncML2(test_mech_driver.OVNMechanismDriverTestCase):
 
         ovn_api = ovn_nb_synchronizer.ovn_nb_api
         mock.patch.object(impl_idl_ovn.OvsdbNbOvnIdl, 'from_worker').start()
+        reconcile_sampling = mock.patch.object(
+            ovn_nb_synchronizer.ovn_log_driver, 'reconcile_sampling').start()
 
         ovn_nb_synchronizer.do_sync()
+
+        if (ovn_nb_synchronizer.mode ==
+                n_lib_ovn_const.OVN_DB_SYNC_MODE_REPAIR):
+            reconcile_sampling.assert_called_once_with(mock.ANY)
+        else:
+            reconcile_sampling.assert_not_called()
 
         create_port_groups_calls = [mock.call(**a)
                                     for a in add_port_groups_list]

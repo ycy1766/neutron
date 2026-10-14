@@ -15,9 +15,11 @@
 
 from unittest import mock
 
+from neutron_lib.api.definitions import logging_output_type as output_apidef
 from neutron_lib.callbacks import events
 from neutron_lib.callbacks import registry
 from neutron_lib.callbacks import resources
+from neutron_lib.services.logapi import constants as log_const
 
 from neutron.services.logapi.common import sg_callback
 from neutron.services.logapi.drivers import base as log_driver_base
@@ -70,3 +72,24 @@ class TestSecurityGroupRuleCallback(base.BaseTestCase):
                          payload=events.DBEventPayload(mock.ANY,
                                                        states=(mock.ANY,)))
         mock_sg_cb.assert_not_called()
+
+    def test_handle_event_includes_flow_sample_logs(self):
+        push_api = mock.Mock()
+        callback = sg_callback.SecurityGroupRuleCallBack(
+            resources.SECURITY_GROUP_RULE, push_api)
+        packet = mock.Mock(id='packet', output_type=output_apidef.PACKET_LOG)
+        flow = mock.Mock(id='flow', output_type=output_apidef.FLOW_SAMPLE)
+        other = mock.Mock(id='other', output_type=output_apidef.PACKET_LOG)
+        payload = mock.Mock(latest_state={'security_group_id': 'sg'},
+                            context=mock.Mock(project_id='project'))
+        with mock.patch.object(
+                sg_callback.db_api, 'get_logs_bound_sg',
+                side_effect=[[packet], [packet, flow, other]]) as get_logs:
+            callback.handle_event(resources.SECURITY_GROUP_RULE,
+                                  events.AFTER_CREATE, mock.ANY, payload)
+        self.assertEqual(2, get_logs.call_count)
+        self.assertEqual('project', get_logs.call_args_list[0].kwargs[
+            'project_id'])
+        self.assertTrue(get_logs.call_args_list[1].kwargs['exclusive'])
+        push_api.assert_called_once_with(
+            log_const.RESOURCE_UPDATE, payload.context, [packet, flow])

@@ -865,6 +865,46 @@ class TestOVNDriverFlowSample(TestOVNDriverBase):
             self._log_driver.delete_log(self.context, packet)
         self._nb_ovn.set_port_group_acl_sampling.assert_not_called()
 
+    def test_reconcile_sampling_all(self):
+        other_sg = uuidutils.generate_uuid()
+        self._log()
+        self._log(resource_id=other_sg, enabled=False)
+        sg_ids = self._log_driver.reconcile_sampling(self.context)
+        self.assertEqual(sorted([self.sg_id, other_sg]), sg_ids)
+        self.assertEqual(
+            2, self._nb_ovn.set_port_group_acl_sampling.call_count)
+
+    def test_reconcile_sampling_without_flow_logs(self):
+        self.assertEqual([], self._log_driver.reconcile_sampling(
+            self.context))
+        self._nb_ovn.set_port_group_acl_sampling.assert_not_called()
+
+    def test_commit_sampling_retries_constraint_violation(self):
+        self._log()
+        txn_exit = self._nb_ovn.transaction.return_value.__exit__
+        txn_exit.side_effect = [
+            RuntimeError('OVSDB Error: constraint violation'), None]
+        self._log_driver.reconcile_sampling(self.context, [self.sg_id])
+        self.assertEqual(2, self._nb_ovn.transaction.call_count)
+
+    def test_commit_sampling_gives_up(self):
+        self._log()
+        txn_exit = self._nb_ovn.transaction.return_value.__exit__
+        txn_exit.side_effect = RuntimeError(
+            'OVSDB Error: constraint violation')
+        self.assertRaises(RuntimeError, self._log_driver.reconcile_sampling,
+                          self.context, [self.sg_id])
+        self.assertEqual(ovn_driver.SAMPLING_TXN_ATTEMPTS,
+                         self._nb_ovn.transaction.call_count)
+
+    def test_commit_sampling_other_error_is_raised(self):
+        self._log()
+        txn_exit = self._nb_ovn.transaction.return_value.__exit__
+        txn_exit.side_effect = RuntimeError('timeout')
+        self.assertRaises(RuntimeError, self._log_driver.reconcile_sampling,
+                          self.context, [self.sg_id])
+        self.assertEqual(1, self._nb_ovn.transaction.call_count)
+
     def test_resource_update_mixed_outputs(self):
         packet = self._log(output_type=ovn_driver.OUTPUT_PACKET_LOG,
                            resource_id=uuidutils.generate_uuid())
