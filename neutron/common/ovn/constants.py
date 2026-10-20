@@ -131,6 +131,13 @@ OVN_SAMPLING_APP_ACL_EST = 'acl-est'
 OVN_SAMPLE_COLLECTOR_NAME = 'neutron-network-log'
 OVN_ACL_SAMPLE_NEW_EXT_ID_KEY = 'neutron:sample_new_metadata'
 OVN_ACL_SAMPLE_EST_EXT_ID_KEY = 'neutron:sample_est_metadata'
+# The Port Group of the security group carries the metadata of the Samples
+# attached for it, one key per observation action and stage, so that a
+# consumer of the Northbound database can map an observation point back to
+# the security group.
+OVN_PG_SAMPLE_ALLOW_NEW_EXT_ID_KEY = 'neutron:sample_allow_new_metadata'
+OVN_PG_SAMPLE_ALLOW_EST_EXT_ID_KEY = 'neutron:sample_allow_est_metadata'
+OVN_PG_SAMPLE_DROP_NEW_EXT_ID_KEY = 'neutron:sample_drop_new_metadata'
 
 # NOTE(lucasagomes): These options were last synced from
 # https://github.com/ovn-org/ovn/blob/feb5d6e81d5a0290aa3618a229c860d01200422e/lib/ovn-l7.h

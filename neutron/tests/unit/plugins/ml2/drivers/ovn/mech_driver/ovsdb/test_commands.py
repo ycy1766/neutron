@@ -1593,7 +1593,8 @@ class TestSetPortGroupAclSamplingCommand(TestSamplingCommandBase):
     def setUp(self):
         super().setUp()
         self.collector = self._owned_collector()
-        self.pg = self._add('Port_Group', name='pg_sg1', acls=[])
+        self.pg = self._add('Port_Group', name='pg_sg1', acls=[],
+                            external_ids={})
 
     def _acl(self, action, log=False, label=0, **columns):
         acl = _SamplingRow(action=action, log=log, label=label,
@@ -1669,6 +1670,28 @@ class TestSetPortGroupAclSamplingCommand(TestSamplingCommandBase):
             self.assertEqual([self.collector.uuid], sample.collectors)
         self.assertIn('acls', self.pg.verified)
         self.assertIn('sample_new', rule1.verified)
+        # The Port Group records the metadata of each identity.
+        self.assertEqual(
+            {ovn_const.OVN_PG_SAMPLE_ALLOW_NEW_EXT_ID_KEY:
+                str(self._md(rule1, 'new')),
+             ovn_const.OVN_PG_SAMPLE_ALLOW_EST_EXT_ID_KEY:
+                str(self._md(rule1, 'est')),
+             ovn_const.OVN_PG_SAMPLE_DROP_NEW_EXT_ID_KEY:
+                str(self._md(drop, 'new'))},
+            self.pg.external_ids)
+        self.assertIn('external_ids', self.pg.verified)
+
+    def test_port_group_inserted_in_transaction(self):
+        # A Port Group inserted earlier in the transaction has no
+        # external_ids column yet; the keys are set on it all the same.
+        self.nb.tables['Port_Group'].rows.pop(self.pg.uuid)
+        self.pg = self._add('Port_Group', name='pg_sg1', acls=[])
+        rule = self._acl(ovn_const.ACL_ACTION_ALLOW_STATELESS)
+        self._run({ovn_const.ACL_ACTION_ALLOW_STATELESS})
+        self.assertEqual(
+            {ovn_const.OVN_PG_SAMPLE_ALLOW_NEW_EXT_ID_KEY:
+                str(self._md(rule, 'new'))},
+            self.pg.external_ids)
 
     def test_stateless_and_accept_only(self):
         rule = self._acl(ovn_const.ACL_ACTION_ALLOW_STATELESS)
@@ -1685,12 +1708,16 @@ class TestSetPortGroupAclSamplingCommand(TestSamplingCommandBase):
         self._run(actions)
         self._commit()
         before = (self._md(rule, 'new'), self._md(rule, 'est'))
+        pg_ext_ids = dict(self.pg.external_ids)
+        self.pg.verified.clear()
         self.txn.inserted = []
         result = self._run(actions)
         self.assertEqual(0, result['attached'])
         self.assertEqual([], self.txn.inserted)
         self.assertEqual(before, (self._md(rule, 'new'),
                                   self._md(rule, 'est')))
+        self.assertEqual(pg_ext_ids, self.pg.external_ids)
+        self.assertNotIn('external_ids', self.pg.verified)
 
     def test_new_acl_reuses_existing_sample(self):
         rule1 = self._acl(ovn_const.ACL_ACTION_ALLOW_RELATED)
@@ -1721,6 +1748,10 @@ class TestSetPortGroupAclSamplingCommand(TestSamplingCommandBase):
         est = self._owned_sample(2)
         self._make_owned(rule, 'new', new)
         self._make_owned(rule, 'est', est)
+        self.pg.external_ids = {
+            ovn_const.OVN_PG_SAMPLE_ALLOW_NEW_EXT_ID_KEY: '1',
+            ovn_const.OVN_PG_SAMPLE_ALLOW_EST_EXT_ID_KEY: '2',
+            ovn_const.OVN_SG_EXT_ID_KEY: 'sg1'}
         result = self._run(set(), collector_id=None)
         self.assertEqual({'conflicts': [], 'attached': 0, 'detached': 2},
                          result)
@@ -1730,15 +1761,23 @@ class TestSetPortGroupAclSamplingCommand(TestSamplingCommandBase):
         for sample in (new, est):
             self.assertEqual({'metadata', 'collectors'}, sample.verified)
         self.assertIn('external_ids', self.collector.verified)
+        # The last attachment removes the metadata keys; other keys stay.
+        self.assertEqual({ovn_const.OVN_SG_EXT_ID_KEY: 'sg1'},
+                         self.pg.external_ids)
 
     def test_detach_only_actions_no_longer_requested(self):
         rule = self._acl(ovn_const.ACL_ACTION_ALLOW_STATELESS)
         drop = self._acl(ovn_const.ACL_ACTION_DROP)
         self._make_owned(rule, 'new', self._owned_sample(1))
         self._make_owned(drop, 'new', self._owned_sample(2))
+        self.pg.external_ids = {
+            ovn_const.OVN_PG_SAMPLE_ALLOW_NEW_EXT_ID_KEY: '1',
+            ovn_const.OVN_PG_SAMPLE_DROP_NEW_EXT_ID_KEY: '2'}
         self._run({ovn_const.ACL_ACTION_ALLOW_STATELESS})
         self.assertEqual(1, self._md(rule, 'new'))
         self.assertEqual([], drop.sample_new)
+        self.assertEqual({ovn_const.OVN_PG_SAMPLE_ALLOW_NEW_EXT_ID_KEY: '1'},
+                         self.pg.external_ids)
 
     def test_foreign_reference_left_unchanged(self):
         rule = self._acl(ovn_const.ACL_ACTION_ALLOW_STATELESS)

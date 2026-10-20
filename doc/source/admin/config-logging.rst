@@ -230,8 +230,14 @@ The IPFIX records carry the observation domain ID, whose upper 8 bits are the
 ``Sampling_App`` ID of the stage and whose lower 24 bits are the OVN datapath
 tunnel key, and the observation point ID, which is the metadata of the Sample
 of the security group, stage and verdict. A collector can map them back to
-the security group through the ``neutron:sample_new_metadata`` and
-``neutron:sample_est_metadata`` keys recorded on the ACLs.
+the security group through the Port Group of the security group, whose
+``external_ids`` carry the security group ID, its project ID and the metadata
+of its Samples in the ``neutron:sample_allow_new_metadata``,
+``neutron:sample_allow_est_metadata`` and ``neutron:sample_drop_new_metadata``
+keys while Neutron-managed Samples are attached. The
+``neutron:sample_new_metadata`` and
+``neutron:sample_est_metadata`` keys recorded on the ACLs remain the ownership
+record that Neutron validates.
 
 
 Understanding the logging

@@ -539,6 +539,23 @@ class LogApiTestCaseFlowSample(LogApiTestCaseComplex):
             self.assertIsNotNone(acl)
             self._check_acl_sampled(acl, stages)
 
+    def _check_pg_sample_keys(self, sg_id, identities):
+        """Check the Sample metadata the Port Group of a SG records.
+
+        :param identities: the (observation action, stage) identities
+            expected to be recorded; their values must be the metadata of
+            existing Samples. The keys of other identities must be absent.
+        """
+        pg = self._find_security_group_row_by_id(sg_id)
+        metadata = {str(ovn_sampling.sample_metadata(sample))
+                    for sample in self._rows('Sample')}
+        for identity, key in ovn_sampling.PG_SAMPLE_EXT_ID_KEY.items():
+            if identity in identities:
+                self.assertIn(pg.external_ids.get(key), metadata,
+                              '%s is not recorded on %s' % (key, pg.name))
+            else:
+                self.assertNotIn(key, pg.external_ids)
+
     def test_create_and_delete(self):
         self.assertEqual([], self._rows('Sampling_App'))
         self.assertEqual([], self._rows('Sample_Collector'))
@@ -567,10 +584,15 @@ class LogApiTestCaseFlowSample(LogApiTestCaseComplex):
                    for stage in ovn_sampling.STAGES
                    if ovn_sampling.referenced_sample(acl, stage)}
         self.assertEqual(3, len(samples))
+        # The Port Group records the metadata of the three identities.
+        self._check_pg_sample_keys(
+            self.sg1, set(ovn_sampling.PG_SAMPLE_EXT_ID_KEY))
+        self._check_pg_sample_keys(self.sg2, set())
 
         self.log_plugin.delete_log(self.ctxt, log_obj['id'])
         self._check_sgrs_sampled(self.sgrs, ())
         self.assertEqual([], self._sg_drop_acls(self.sg1))
+        self._check_pg_sample_keys(self.sg1, set())
         # The global rows are kept for the next log.
         self._check_global_rows()
 
@@ -579,14 +601,19 @@ class LogApiTestCaseFlowSample(LogApiTestCaseComplex):
         log_obj = self.log_plugin.create_log(self.ctxt, log_data)
         self._check_sgrs_sampled(self.sg2rs, ovn_sampling.STAGES)
         self.assertEqual([], self._sg_drop_acls(self.sg2))
+        allow_identities = {(ovn_sampling.OBSERVE_ALLOW, stage)
+                            for stage in ovn_sampling.STAGES}
+        self._check_pg_sample_keys(self.sg2, allow_identities)
 
         log_data['log']['enabled'] = False
         self.log_plugin.update_log(self.ctxt, log_obj['id'], log_data)
         self._check_sgrs_sampled(self.sg2rs, ())
+        self._check_pg_sample_keys(self.sg2, set())
 
         log_data['log']['enabled'] = True
         self.log_plugin.update_log(self.ctxt, log_obj['id'], log_data)
         self._check_sgrs_sampled(self.sg2rs, ovn_sampling.STAGES)
+        self._check_pg_sample_keys(self.sg2, allow_identities)
 
     def test_new_rule_is_sampled(self):
         self.log_plugin.create_log(self.ctxt, self._flow_log_data(self.sg1))

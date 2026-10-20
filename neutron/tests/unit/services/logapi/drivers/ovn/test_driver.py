@@ -1003,6 +1003,15 @@ class TestOVNDriverFlowSample(TestOVNDriverBase):
         return self._nb_ovn.set_port_group_acl_sampling.call_args.kwargs[
             'remove_unlogged_drop_acls']
 
+    def test_reconcile_sampling_detaches_pg_sample_keys(self):
+        # Only the Port Group still records the metadata of a Sample.
+        pg = self._pg_row(self.sg_id, [])
+        pg.external_ids[ovn_const.OVN_PG_SAMPLE_DROP_NEW_EXT_ID_KEY] = '7'
+        self._set_pgs(pg)
+        self.assertEqual([self.sg_id],
+                         self._log_driver.reconcile_sampling(self.context))
+        self.assertEqual(set(), self._set_call()[1])
+
     def test_reconcile_sampling_prunes_unlogged_drop_acls(self):
         # The command removes the ACLs inside the transaction.
         self._set_pgs(self._pg_row(self.sg_id, [self._drop_acl(),

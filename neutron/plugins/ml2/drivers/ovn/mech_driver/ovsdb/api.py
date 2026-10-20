@@ -279,6 +279,10 @@ class API(api.API, metaclass=abc.ABCMeta):
                                     remove_unlogged_drop_acls=False):
         """Converge the Neutron sample references of a Port Group's ACLs.
 
+        The Port Group external_ids record the metadata of the Samples
+        attached for the security group, one key per observation action
+        and stage; the keys of identities no longer attached are removed.
+
         :param port_group:   The Port Group name
         :type port_group:    string
         :param acl_actions:  The ACL actions to sample; empty to remove all

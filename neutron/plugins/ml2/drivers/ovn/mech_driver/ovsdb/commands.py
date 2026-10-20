@@ -1414,6 +1414,9 @@ class SetPortGroupAclSamplingCommand(command.BaseCommand):
     with ``raise_on_conflict`` a conflict on a stage that must be attached
     aborts the transaction with ``OVNSamplingResourceConflict``.
 
+    The Port Group records the metadata of the Samples attached for the
+    security group, one external_ids key per observation action and stage.
+
     The plan is computed from the rows seen inside the transaction, so ACLs
     added or removed earlier in the same transaction are taken into account
     and a concurrent change makes the IDL retry the whole command.
@@ -1595,6 +1598,28 @@ class SetPortGroupAclSamplingCommand(command.BaseCommand):
         for acl, md in new_stage_md.values():
             if getattr(acl, 'log', False) and getattr(acl, 'label', 0) != md:
                 acl.label = md
+
+        # Record the metadata of the Samples attached for this security
+        # group on its Port Group, and drop the keys of the identities that
+        # are no longer attached. The ownership record stays on the ACLs;
+        # these keys let a consumer of the Northbound database map an
+        # observation point back to the security group.
+        pg_ext_ids = getattr(pg, 'external_ids', {})
+        set_keys = {}
+        del_keys = []
+        for identity, key in sampling.PG_SAMPLE_EXT_ID_KEY.items():
+            md = identity_md.get(identity)
+            if md is not None:
+                if pg_ext_ids.get(key) != str(md):
+                    set_keys[key] = str(md)
+            elif key in pg_ext_ids:
+                del_keys.append(key)
+        if set_keys or del_keys:
+            pg.verify('external_ids')
+            for key, value in set_keys.items():
+                pg.setkey('external_ids', key, value)
+            for key in del_keys:
+                pg.delkey('external_ids', key)
 
         self.result = {'conflicts': conflicts, 'attached': attached,
                        'detached': detached}

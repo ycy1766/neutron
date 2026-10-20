@@ -693,15 +693,20 @@ class OVNDriver(base.DriverBase):
     def _sg_ids_with_sampling_state(self):
         """Return the security groups whose Port Group carries sampling.
 
-        A Port Group carries Neutron sampling state when one of its ACLs
-        has a Sample metadata recorded by Neutron or is a per-SG drop ACL
-        without packet logging.
+        A Port Group carries Neutron sampling state when it records the
+        metadata of a Sample, or when one of its ACLs has a Sample metadata
+        recorded by Neutron or is a per-SG drop ACL without packet logging.
         """
         sg_ids = set()
         for pg in self.ovn_nb.db_list_rows('Port_Group').execute(
                 check_error=True):
             sg_id = pg.external_ids.get(ovn_const.OVN_SG_EXT_ID_KEY)
-            if sg_id and any(
+            if not sg_id:
+                continue
+            if any(key in pg.external_ids
+                   for key in ovn_sampling.PG_SAMPLE_EXT_ID_KEY.values()):
+                sg_ids.add(sg_id)
+            elif any(
                     self._is_unlogged_drop_acl(acl) or
                     any(ovn_sampling.recorded_metadata(acl, stage)
                         for stage in ovn_sampling.STAGES)
