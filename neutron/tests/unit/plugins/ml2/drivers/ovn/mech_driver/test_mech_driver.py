@@ -280,7 +280,9 @@ class TestOVNMechanismDriver(TestOVNMechanismDriverBase):
             resources.SECURITY_GROUP, events.AFTER_CREATE, {},
             payload=events.DBEventPayload(
                 self.context, states=(self.fake_sg,)))
-        external_ids = {ovn_const.OVN_SG_EXT_ID_KEY: self.fake_sg['id']}
+        external_ids = {
+            ovn_const.OVN_SG_EXT_ID_KEY: self.fake_sg['id'],
+            ovn_const.OVN_PROJID_EXT_ID_KEY: self.fake_sg['project_id']}
         pg_name = ovn_utils.ovn_port_group_name(self.fake_sg['id'])
 
         self.nb_ovn.pg_add.assert_called_once_with(
@@ -5268,7 +5270,9 @@ class TestOVNMechanismDriverSecurityGroup(
         expected_pg_name = ovn_utils.ovn_port_group_name(sg['id'])
         expected_pg_add_calls = [
             mock.call(acls=[],
-                      external_ids={'neutron:security_group_id': sg['id']},
+                      external_ids={
+                          'neutron:security_group_id': sg['id'],
+                          'neutron:project_id': sg['project_id']},
                       name=expected_pg_name),
         ]
         self.mech_driver.nb_ovn.pg_add.assert_has_calls(

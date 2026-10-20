@@ -1017,7 +1017,8 @@ class TestOvnNbSyncML2(test_mech_driver.OVNMechanismDriverTestCase):
             {'networks': self.lrport_networks})
 
         add_port_groups_list = [
-            {'external_ids': {ovn_const.OVN_SG_EXT_ID_KEY: 'sg2'},
+            {'external_ids': {ovn_const.OVN_SG_EXT_ID_KEY: 'sg2',
+                              ovn_const.OVN_PROJID_EXT_ID_KEY: 'project1'},
              'name': 'pg_sg2',
              'acls': []}]
         del_port_groups_list = ['pg_unknown_del', 'pg_sg_stale']

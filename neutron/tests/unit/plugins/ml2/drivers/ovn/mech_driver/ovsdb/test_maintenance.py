@@ -811,6 +811,47 @@ class TestDBInconsistenciesPeriodics(testlib_api.SqlTestCaseLight,
         self.fake_ovn_client._nb_idl.set_lswitch_port.assert_has_calls(
             expected_calls)
 
+    def test_add_project_id_to_security_group_port_groups(self):
+        nb_idl = self.fake_ovn_client._nb_idl
+        nb_idl.get_sg_port_groups.return_value = {
+            # SG Port Group created before the change: gets the project ID.
+            'pg_sg0': {'external_ids': {constants.OVN_SG_EXT_ID_KEY: 'sg0'}},
+            # SG Port Group that already has it: untouched.
+            'pg_sg1': {'external_ids': {
+                constants.OVN_SG_EXT_ID_KEY: 'sg1',
+                constants.OVN_PROJID_EXT_ID_KEY: 'p1'}},
+            # Stale SG Port Group without a Neutron SG: left to the DB sync.
+            'pg_sg_stale': {'external_ids': {
+                constants.OVN_SG_EXT_ID_KEY: 'stale'}},
+        }
+        self.fake_ovn_client._plugin.get_security_groups.return_value = [
+            {'id': 'sg0', 'project_id': 'p0'}]
+
+        self.assertRaises(
+            periodics.NeverAgain,
+            self.periodic.add_project_id_to_security_group_port_groups)
+
+        self.fake_ovn_client._plugin.get_security_groups.\
+            assert_called_once_with(mock.ANY, fields=['id', 'project_id'])
+        nb_idl.db_add.assert_called_once_with(
+            'Port_Group', 'pg_sg0', 'external_ids',
+            {constants.OVN_PROJID_EXT_ID_KEY: 'p0'})
+
+    def test_add_project_id_to_security_group_port_groups_nothing_to_do(
+            self):
+        nb_idl = self.fake_ovn_client._nb_idl
+        nb_idl.get_sg_port_groups.return_value = {
+            'pg_sg1': {'external_ids': {
+                constants.OVN_SG_EXT_ID_KEY: 'sg1',
+                constants.OVN_PROJID_EXT_ID_KEY: 'p1'}}}
+
+        self.assertRaises(
+            periodics.NeverAgain,
+            self.periodic.add_project_id_to_security_group_port_groups)
+
+        self.fake_ovn_client._plugin.get_security_groups.assert_not_called()
+        nb_idl.transaction.assert_not_called()
+
     def test_check_router_default_route_empty_dst_ip(self):
         nb_idl = self.fake_ovn_client._nb_idl
         route0 = fakes.FakeOvsdbRow.create_one_ovsdb_row(

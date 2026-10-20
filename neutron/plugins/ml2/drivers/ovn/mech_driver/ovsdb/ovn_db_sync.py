@@ -155,7 +155,7 @@ class OvnNbSynchronizer(db_sync_base.BaseOvnDbSynchronizer):
             for sg in self.core_plugin.get_security_groups(ctx):
                 pg_name = utils.ovn_port_group_name(sg['id'])
                 neutron_pgs.add(pg_name)
-                neutron_sgs[pg_name] = sg['id']
+                neutron_sgs[pg_name] = sg
             neutron_pgs.add(ovn_const.OVN_DROP_PORT_GROUP_NAME)
 
         ovn_pgs = set()
@@ -198,13 +198,14 @@ class OvnNbSynchronizer(db_sync_base.BaseOvnDbSynchronizer):
                                 pg, n_port['id']))
 
                 for pg in add_pgs:
-                    # If it's a security group PG, add the ext id
-                    ext_ids = {ovn_const.OVN_SG_EXT_ID_KEY: neutron_sgs[pg]}
+                    # If it's a security group PG, add the ext ids
+                    sg = neutron_sgs[pg]
+                    ext_ids = utils.ovn_sg_port_group_external_ids(sg)
                     txn.add(self.ovn_nb_api.pg_add(name=pg, acls=[],
                                                 external_ids=ext_ids))
                     # Add the ports belonging to the SG to this port group
                     for n_port in db_ports:
-                        if (neutron_sgs[pg] in n_port['security_groups'] and
+                        if (sg['id'] in n_port['security_groups'] and
                                 n_port['id'] in ovn_ports):
                             txn.add(self.ovn_nb_api.pg_add_ports(
                                 pg, n_port['id']))

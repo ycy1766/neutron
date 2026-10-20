@@ -1673,6 +1673,50 @@ class DBInconsistenciesPeriodics(SchemaAwarePeriodicsBase):
 
         raise periodics.NeverAgain()
 
+    # TODO(ycy1766): to remove in I+3=L (2028.2) cycle
+    #                (2nd next SLURP release)
+    # A static spacing value is used here, but this method will only run
+    # once per lock due to the use of periodics.NeverAgain().
+    @has_lock_periodic(
+        periodic_run_limit=ovn_const.MAINTENANCE_TASK_RETRY_LIMIT,
+        spacing=ovn_const.MAINTENANCE_ONE_RUN_TASK_SPACING,
+        run_immediately=True)
+    def add_project_id_to_security_group_port_groups(self):
+        """Backfill OVN_PROJID_EXT_ID_KEY on existing SG Port Groups.
+
+        The Port Group of a security group now carries the project ID of
+        the security group in its external_ids. This one-time task adds
+        the key to the Port Groups created before this change.
+        """
+        pgs = {}
+        for pg_name, pg in self._nb_idl.get_sg_port_groups().items():
+            ext_ids = pg['external_ids']
+            if ovn_const.OVN_PROJID_EXT_ID_KEY not in ext_ids:
+                pgs[ext_ids[ovn_const.OVN_SG_EXT_ID_KEY]] = pg_name
+
+        if not pgs:
+            raise periodics.NeverAgain()
+
+        context = n_context.get_admin_context()
+        projects = {
+            sg['id']: sg['project_id']
+            for sg in self._ovn_client._plugin.get_security_groups(
+                context, fields=['id', 'project_id'])}
+
+        with self._nb_idl.transaction(check_error=True) as txn:
+            for sg_id, pg_name in pgs.items():
+                # A Port Group without a security group is left to the
+                # DB sync tool.
+                if sg_id not in projects:
+                    continue
+                # db_add verifies the column, so a concurrent change of
+                # the other keys (the sampling metadata) is not lost.
+                txn.add(self._nb_idl.db_add(
+                    'Port_Group', pg_name, 'external_ids',
+                    {ovn_const.OVN_PROJID_EXT_ID_KEY: projects[sg_id]}))
+
+        raise periodics.NeverAgain()
+
 
 class HashRingHealthCheckPeriodics:
 

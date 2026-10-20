@@ -371,6 +371,12 @@ def ovn_port_group_name(sg_id):
     return ('pg-%s' % sg_id).replace('-', '_')
 
 
+def ovn_sg_port_group_external_ids(security_group):
+    """Return the external_ids of the Port Group of a security group."""
+    return {constants.OVN_SG_EXT_ID_KEY: security_group['id'],
+            constants.OVN_PROJID_EXT_ID_KEY: security_group['project_id']}
+
+
 def is_network_device_port(port):
     return port.get('device_owner', '').startswith(
         const.DEVICE_OWNER_PREFIXES)

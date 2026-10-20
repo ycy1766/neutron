@@ -3045,7 +3045,7 @@ class OVNClient:
 
     def create_security_group(self, context, security_group):
         with self._nb_idl.transaction(check_error=True) as txn:
-            ext_ids = {ovn_const.OVN_SG_EXT_ID_KEY: security_group['id']}
+            ext_ids = utils.ovn_sg_port_group_external_ids(security_group)
             name = utils.ovn_port_group_name(security_group['id'])
             txn.add(self._nb_idl.pg_add(
                 name=name, acls=[], external_ids=ext_ids))
