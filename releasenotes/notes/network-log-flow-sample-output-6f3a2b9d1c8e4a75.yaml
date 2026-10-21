@@ -1,0 +1,16 @@
+---
+features:
+  - |
+    The network log API supports the ``logging-output-type`` extension. A
+    log can be created with ``output_type`` set to ``flow_sample`` to
+    request samples of the traffic matched by a security group instead of
+    packet log lines; ``packet_log`` remains the default. The ML2/OVN
+    logging driver implements the new output with OVN ACL sampling when
+    ``[network_log] ovn_acl_sampling`` is enabled and the sampling
+    identifiers are configured; the OVS ``Flow_Sample_Collector_Set`` and
+    IPFIX exporter of each chassis are configured by the operator. A
+    ``flow_sample`` log must select a security group with ``resource_id``
+    and must not set ``target_id``. Creating or enabling such a log
+    requires the ``create_log:output_type`` policy, which defaults to
+    administrators. The ``loggable-resources`` response lists the
+    ``output_types`` supported for each resource type.

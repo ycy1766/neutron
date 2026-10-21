@@ -14,6 +14,7 @@
 #    under the License.
 
 from neutron_lib.api.definitions import logging
+from neutron_lib.api.definitions import logging_output_type as output_apidef
 from neutron_lib.callbacks import events
 from neutron_lib.callbacks import registry
 from neutron_lib.callbacks import resources
@@ -24,6 +25,7 @@ from neutron.db import db_base_plugin_common
 from neutron.extensions import logging as log_ext
 from neutron.objects import base as base_obj
 from neutron.objects.logapi import logging_resource as log_object
+from neutron import policy
 from neutron.services.logapi.common import db_api as log_db_api
 from neutron.services.logapi.common import exceptions as log_exc
 from neutron.services.logapi.common import validators
@@ -34,7 +36,7 @@ from neutron.services.logapi.drivers import manager as driver_mgr
 class LoggingPlugin(log_ext.LoggingPluginBase):
     """Implementation of the Neutron logging api plugin."""
 
-    supported_extension_aliases = [logging.ALIAS]
+    supported_extension_aliases = [logging.ALIAS, output_apidef.ALIAS]
 
     __native_pagination_support = True
     __native_sorting_support = True
@@ -96,6 +98,7 @@ class LoggingPlugin(log_ext.LoggingPluginBase):
         """Create a log object"""
         log_data = log['log']
         self.validator_mgr.validate_request(context, log_data)
+        validators.validate_log_output_type(context, log_data)
         with db_api.CONTEXT_WRITER.using(context):
             # body 'log' contains both tenant_id and project_id
             # but only latter needs to be used to create Log object.
@@ -115,6 +118,8 @@ class LoggingPlugin(log_ext.LoggingPluginBase):
     def update_log(self, context, log_id, log):
         """Update information for the specified log object"""
         log_data = log['log']
+        if log_data.get('enabled'):
+            self._check_enable_log(context, log_id)
         with db_api.CONTEXT_WRITER.using(context):
             log_obj = log_object.Log(context, id=log_id)
             log_obj.update_fields(log_data, reset_changes=True)
@@ -138,9 +143,28 @@ class LoggingPlugin(log_ext.LoggingPluginBase):
         self.driver_manager.call(
             log_const.DELETE_LOG, context, log_obj)
 
+    def _check_enable_log(self, context, log_id):
+        """Validate a log that is being enabled.
+
+        A disabled log with an output other than packet logging is
+        validated again before it is enabled, as the deployment may have
+        changed since it was created. Enabling it requires the same
+        permission as creating it.
+        """
+        log_obj = self._get_log(context, log_id)
+        if (log_obj.enabled or
+                validators.get_log_output_type(log_obj) ==
+                output_apidef.PACKET_LOG):
+            return
+        policy.enforce(context, 'create_log:output_type',
+                       {'project_id': log_obj.project_id})
+        validators.validate_log_output_type(context, log_obj)
+
     def get_loggable_resources(self, context, filters=None, fields=None,
                                sorts=None, limit=None,
                                marker=None, page_reverse=False):
-        """Get supported logging types"""
-        return [{'type': type_}
+        """Get supported logging types and their output types"""
+        return [{'type': type_,
+                 output_apidef.OUTPUT_TYPES: sorted(
+                     self.driver_manager.supported_output_types(type_))}
                 for type_ in self.supported_logging_types]

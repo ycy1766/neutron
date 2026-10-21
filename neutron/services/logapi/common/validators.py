@@ -13,11 +13,13 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from neutron_lib.api.definitions import logging_output_type as output_apidef
 from neutron_lib.api.definitions import portbindings
 from neutron_lib import constants
 from neutron_lib.plugins import constants as plugin_const
 from neutron_lib.plugins import directory
 from neutron_lib.plugins import utils
+from neutron_lib.services.logapi import constants as log_const
 from oslo_log import log as logging
 
 from neutron.services.logapi.common import exceptions as log_exc
@@ -81,6 +83,52 @@ def validate_log_type_for_port(log_type, port):
         if driver.is_logging_type_supported(log_type):
             return True
     return False
+
+
+def _log_attr(log, name):
+    if isinstance(log, dict):
+        return log.get(name)
+    return getattr(log, name, None)
+
+
+def get_log_output_type(log):
+    """Return the output type of a log dict or object.
+
+    Logs stored before the ``logging-output-type`` extension have no output
+    type and use packet logging.
+    """
+    output_type = _log_attr(log, output_apidef.OUTPUT_TYPE)
+    if isinstance(output_type, str):
+        return output_type
+    return output_apidef.PACKET_LOG
+
+
+def validate_log_output_type(context, log):
+    """Validate the output type of a log that is created or enabled.
+
+    :param log: the request body of a log being created, or the log object
+        being enabled.
+    :raises FlowSampleSelectorNotSupported: if a flow_sample log does not
+        select exactly one security group.
+    :raises LogOutputTypeNotSupported: if no loaded driver supports the
+        output for the resource type, or a loaded driver for that resource
+        type does not support it.
+    """
+    output_type = get_log_output_type(log)
+    if output_type == output_apidef.PACKET_LOG:
+        return
+    if output_type == output_apidef.FLOW_SAMPLE:
+        if (_log_attr(log, 'resource_type') != log_const.SECURITY_GROUP or
+                not _log_attr(log, 'resource_id') or
+                _log_attr(log, 'target_id')):
+            raise log_exc.FlowSampleSelectorNotSupported()
+    resource_type = _log_attr(log, 'resource_type')
+    log_plugin = directory.get_plugin(alias=plugin_const.LOG_API)
+    supported = log_plugin.driver_manager.supported_output_types(
+        resource_type)
+    if output_type not in supported:
+        raise log_exc.LogOutputTypeNotSupported(
+            output_type=output_type, resource_type=resource_type)
 
 
 class ResourceValidateRequest:

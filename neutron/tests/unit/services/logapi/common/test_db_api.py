@@ -16,6 +16,7 @@
 import copy
 from unittest import mock
 
+from neutron_lib.api.definitions import logging_output_type as output_apidef
 from neutron_lib import constants as const
 from neutron_lib import context
 from neutron_lib.db import api as n_db_api
@@ -84,7 +85,8 @@ class LoggingDBApiTestCase(test_sg.SecurityGroupDBTestCase):
             # Test get log objects with required resource type
             calls = [mock.call(self.context, project_id=self._project_id,
                                resource_type=log_const.SECURITY_GROUP,
-                               enabled=True)]
+                               enabled=True,
+                               output_type=output_apidef.PACKET_LOG)]
             log_object.Log.get_objects.assert_has_calls(calls)
 
     def test_get_logs_not_bound_port(self):
@@ -99,7 +101,8 @@ class LoggingDBApiTestCase(test_sg.SecurityGroupDBTestCase):
             # Test get log objects with required resource type
             calls = [mock.call(self.context, project_id=self._project_id,
                                resource_type=log_const.SECURITY_GROUP,
-                               enabled=True)]
+                               enabled=True,
+                               output_type=output_apidef.PACKET_LOG)]
             log_object.Log.get_objects.assert_has_calls(calls)
 
     def test_get_logs_bound_sg(self):

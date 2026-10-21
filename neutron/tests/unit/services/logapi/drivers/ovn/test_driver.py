@@ -26,6 +26,7 @@ from neutron.common.ovn import sampling as ovn_sampling
 from neutron.common.ovn import utils as ovn_utils
 from neutron.objects import securitygroup as sg_obj
 from neutron.services.logapi.common import db_api
+from neutron.services.logapi.common import exceptions as log_exc
 from neutron.services.logapi.drivers.ovn import driver as ovn_driver
 from neutron.tests import base
 from neutron.tests.unit import fake_resources
@@ -672,6 +673,20 @@ class TestOVNDriverFlowSample(TestOVNDriverBase):
         self.assertEqual(ovn_driver.OUTPUT_PACKET_LOG,
                          ovn_driver.log_output_type(log_obj))
 
+    def test_output_types(self):
+        both = (ovn_driver.OUTPUT_PACKET_LOG, ovn_driver.OUTPUT_FLOW_SAMPLE)
+        self.assertEqual(both, self._log_driver.available_output_types)
+        self.fake_cfg_network_log.ovn_acl_sampling = False
+        self.assertEqual((ovn_driver.OUTPUT_PACKET_LOG,),
+                         self._log_driver.available_output_types)
+        self.fake_cfg_network_log.ovn_acl_sampling = True
+        self._nb_ovn.is_col_present.return_value = False
+        self.assertEqual((ovn_driver.OUTPUT_PACKET_LOG,),
+                         self._log_driver.available_output_types)
+        # Flow-sample logs reach the driver even when sampling is not
+        # available, so that they can be disabled and deleted.
+        self.assertEqual(both, self._log_driver.supported_output_types)
+
     def test_create_log_sampling_disabled(self):
         self.fake_cfg_network_log.ovn_acl_sampling = False
         log_obj = self._log()
@@ -698,10 +713,10 @@ class TestOVNDriverFlowSample(TestOVNDriverBase):
 
     def test_create_log_rejects_port_selector(self):
         log_obj = self._log(target_id=uuidutils.generate_uuid())
-        self.assertRaises(ovn_driver.FlowSampleSelectorNotSupported,
+        self.assertRaises(log_exc.FlowSampleSelectorNotSupported,
                           self._log_driver.create_log, self.context, log_obj)
         log_obj = self._log(resource_id=None)
-        self.assertRaises(ovn_driver.FlowSampleSelectorNotSupported,
+        self.assertRaises(log_exc.FlowSampleSelectorNotSupported,
                           self._log_driver.create_log, self.context, log_obj)
         self._nb_ovn.set_port_group_acl_sampling.assert_not_called()
 
@@ -832,10 +847,26 @@ class TestOVNDriverFlowSample(TestOVNDriverBase):
         self._log_driver.update_log(self.context, log_obj)
         self._nb_ovn.pg_acl_del.assert_not_called()
 
-    def test_update_log_enable_sampling_disabled(self):
+    def test_update_log_enabled_with_sampling_disabled(self):
+        # The plugin validates a log that is being enabled; an update of a
+        # log that stays enabled detaches the sampling that can no longer
+        # be applied instead of failing.
         self.fake_cfg_network_log.ovn_acl_sampling = False
         log_obj = self._log()
-        self.assertRaises(ovn_driver.FlowSamplingNotAvailable,
+        self._log_driver.update_log(self.context, log_obj)
+        self.assertEqual((self.pg_name, set(), None), self._set_call())
+        self.assertFalse(self._nb_ovn.set_port_group_acl_sampling.call_args
+                         .kwargs['raise_on_conflict'])
+
+    def test_update_log_enabled_is_strict(self):
+        log_obj = self._log(event=log_const.ACCEPT_EVENT)
+        self._log_driver.update_log(self.context, log_obj)
+        self.assertTrue(self._nb_ovn.set_port_group_acl_sampling.call_args
+                        .kwargs['raise_on_conflict'])
+
+    def test_update_log_enabled_rejects_port_selector(self):
+        log_obj = self._log(target_id=uuidutils.generate_uuid())
+        self.assertRaises(log_exc.FlowSampleSelectorNotSupported,
                           self._log_driver.update_log, self.context, log_obj)
 
     def test_update_log_disable_with_sampling_disabled(self):

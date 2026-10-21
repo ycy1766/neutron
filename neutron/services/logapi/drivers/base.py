@@ -13,6 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from neutron_lib.api.definitions import logging_output_type as output_apidef
 from neutron_lib.callbacks import events
 from neutron_lib.callbacks import registry
 from neutron_lib.services.logapi import constants as log_const
@@ -28,7 +29,8 @@ LOG = logging.getLogger(__name__)
 class DriverBase(api_base.LoggingApiBase):
 
     def __init__(self, name, vif_types, vnic_types,
-                 supported_logging_types, requires_rpc=False):
+                 supported_logging_types, requires_rpc=False,
+                 supported_output_types=None):
         """Instantiate a log driver.
 
         :param name: driver name.
@@ -37,6 +39,8 @@ class DriverBase(api_base.LoggingApiBase):
         :param supported_logging_types: list of supported logging types.
         :param requires_rpc: indicates if this driver expects rpc sever
                to notify or callback
+        :param supported_output_types: list of supported log output types;
+               packet logging only if not given.
         """
 
         self.name = name
@@ -44,6 +48,33 @@ class DriverBase(api_base.LoggingApiBase):
         self.vnic_types = vnic_types
         self.supported_logging_types = supported_logging_types
         self.requires_rpc = requires_rpc
+        self._supported_output_types = tuple(
+            supported_output_types or (output_apidef.PACKET_LOG,))
+
+    @property
+    def supported_output_types(self):
+        """The log output types this driver implements.
+
+        The driver receives the logs of these outputs whether or not it can
+        apply them at the moment, see available_output_types.
+        """
+        return self._supported_output_types
+
+    @property
+    def available_output_types(self):
+        """The log output types this driver can apply at the moment.
+
+        These outputs are advertised to the API user and a log is validated
+        against them when it is created or enabled. A driver whose support
+        depends on the deployment, for example on the backend version,
+        overrides this property. It still receives the logs of every
+        supported output, so that a log created while its output was
+        available can be disabled and deleted after it no longer is.
+        """
+        return self.supported_output_types
+
+    def is_output_type_supported(self, output_type):
+        return output_type in self.supported_output_types
 
     # The log driver should advertise itself as supported driver by calling
     # register_driver() on the LoggingServiceDriverManager. Therefore,

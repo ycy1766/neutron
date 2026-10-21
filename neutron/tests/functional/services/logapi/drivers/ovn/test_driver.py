@@ -10,11 +10,15 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from neutron_lib.api.definitions import logging_output_type as output_apidef
 from neutron_lib import constants as n_const
 from neutron_lib import context
+from neutron_lib import exceptions as n_exc
 from neutron_lib.services.logapi import constants as log_const
+from oslo_config import cfg
 
 from neutron.common.ovn import constants as ovn_const
+from neutron.common.ovn import sampling as ovn_sampling
 from neutron.common.ovn import utils
 from neutron.services.logapi.common import exceptions as log_exc
 from neutron.tests.functional import base as functional_base
@@ -448,3 +452,213 @@ class LogApiTestCaseComplex(LogApiTestCaseBase):
                              'ACL for rule %s was unnecessarily re-updated'
                              % sgr)
         self._check_sg_drop_acls(self.sg3, is_enabled=True)
+
+
+class LogApiTestCaseFlowSample(LogApiTestCaseComplex):
+    """Flow-sample network logs on the ML2/OVN driver."""
+
+    APP_NEW_ID = 11
+    APP_EST_ID = 12
+    COLLECTOR_ID = 13
+    COLLECTOR_SET_ID = 1000
+    PROBABILITY = 65535
+
+    def setUp(self):
+        super().setUp()
+        if not self.nb_api.is_col_present('ACL', 'sample_new'):
+            self.skipTest('The OVN Northbound schema has no ACL sampling')
+        cfg.CONF.set_override('ovn_acl_sampling', True, group='network_log')
+        cfg.CONF.set_override('ovn_acl_sampling_app_new_id', self.APP_NEW_ID,
+                              group='network_log')
+        cfg.CONF.set_override('ovn_acl_sampling_app_est_id', self.APP_EST_ID,
+                              group='network_log')
+        cfg.CONF.set_override('ovn_acl_sampling_collector_id',
+                              self.COLLECTOR_ID, group='network_log')
+        cfg.CONF.set_override('ovn_acl_sampling_collector_set_id',
+                              self.COLLECTOR_SET_ID, group='network_log')
+        cfg.CONF.set_override('ovn_acl_sampling_probability',
+                              self.PROBABILITY, group='network_log')
+
+    def _flow_log_data(self, sg_id, event=log_const.ALL_EVENT, enabled=True,
+                       output_type=output_apidef.FLOW_SAMPLE):
+        log_data = self._log_data(sg_id=sg_id, enabled=enabled)
+        log_data['log']['event'] = event
+        log_data['log']['output_type'] = output_type
+        return log_data
+
+    def _rows(self, table):
+        return list(self.nb_api._tables[table].rows.values())
+
+    def _owned_rows(self, table):
+        return [row for row in self._rows(table)
+                if ovn_sampling.is_owned_row(row)]
+
+    def _sg_drop_acls(self, sg_id):
+        pg = self.nb_api.get_port_group(utils.ovn_port_group_name(sg_id))
+        return [acl for acl in pg.acls
+                if acl.priority == ovn_const.ACL_PRIORITY_LOG_DROP and
+                acl.action == ovn_const.ACL_ACTION_DROP]
+
+    def _check_global_rows(self):
+        apps = {app.type: app for app in self._owned_rows('Sampling_App')}
+        self.assertEqual({ovn_const.OVN_SAMPLING_APP_ACL_NEW,
+                          ovn_const.OVN_SAMPLING_APP_ACL_EST}, set(apps))
+        self.assertEqual(self.APP_NEW_ID,
+                         apps[ovn_const.OVN_SAMPLING_APP_ACL_NEW].id)
+        self.assertEqual(self.APP_EST_ID,
+                         apps[ovn_const.OVN_SAMPLING_APP_ACL_EST].id)
+        collectors = self._owned_rows('Sample_Collector')
+        self.assertEqual(1, len(collectors))
+        collector = collectors[0]
+        self.assertEqual(self.COLLECTOR_ID, collector.id)
+        self.assertEqual(self.COLLECTOR_SET_ID, collector.set_id)
+        self.assertEqual(self.PROBABILITY, collector.probability)
+        self.assertEqual(ovn_const.OVN_SAMPLE_COLLECTOR_NAME, collector.name)
+        return collector
+
+    def _check_acl_sampled(self, acl, stages, collector=None):
+        """Check which stages of an ACL reference a Neutron Sample."""
+        collector = collector or self._owned_rows('Sample_Collector')[0]
+        for stage in ovn_sampling.STAGES:
+            ref = ovn_sampling.referenced_sample(acl, stage)
+            key = ovn_sampling.STAGE_ACL_EXT_ID_KEY[stage]
+            if stage in stages:
+                self.assertIsNotNone(ref, '%s of ACL %s is not sampled' %
+                                     (stage, acl.uuid))
+                self.assertEqual([collector.uuid],
+                                 ovn_sampling.sample_collector_uuids(ref))
+                self.assertEqual(str(ref.metadata), acl.external_ids[key])
+            else:
+                self.assertIsNone(ref, '%s of ACL %s is sampled' %
+                                  (stage, acl.uuid))
+                self.assertNotIn(key, acl.external_ids)
+
+    def _check_sgrs_sampled(self, sgrs, stages):
+        for sgr in sgrs:
+            acl = self._find_security_group_rule_row_by_id(sgr)
+            self.assertIsNotNone(acl)
+            self._check_acl_sampled(acl, stages)
+
+    def test_create_and_delete(self):
+        self.assertEqual([], self._rows('Sampling_App'))
+        self.assertEqual([], self._rows('Sample_Collector'))
+
+        log_obj = self.log_plugin.create_log(
+            self.ctxt, self._flow_log_data(self.sg1))
+        self.assertEqual(output_apidef.FLOW_SAMPLE, log_obj['output_type'])
+        collector = self._check_global_rows()
+        # Stateful allow rules are sampled on both connection stages.
+        self._check_sgrs_sampled(self.sg1rs, ovn_sampling.STAGES)
+        self._check_sgrs_sampled(self.sg2rs + self.sg3rs, ())
+        # The drop ACLs of the security group exist without packet logging
+        # and are sampled on the new stage.
+        drop_acls = self._sg_drop_acls(self.sg1)
+        self.assertEqual(2, len(drop_acls))
+        for acl in drop_acls:
+            self.assertFalse(acl.log)
+            self._check_acl_sampled(acl, (ovn_sampling.STAGE_NEW,),
+                                    collector)
+        self.assertEqual([], self._sg_drop_acls(self.sg2))
+        # One Sample per stage and observation action.
+        samples = {ovn_sampling.referenced_sample(acl, stage).uuid
+                   for acl in self._sg_drop_acls(self.sg1) + [
+                       self._find_security_group_rule_row_by_id(sgr)
+                       for sgr in self.sg1rs]
+                   for stage in ovn_sampling.STAGES
+                   if ovn_sampling.referenced_sample(acl, stage)}
+        self.assertEqual(3, len(samples))
+
+        self.log_plugin.delete_log(self.ctxt, log_obj['id'])
+        self._check_sgrs_sampled(self.sgrs, ())
+        self.assertEqual([], self._sg_drop_acls(self.sg1))
+        # The global rows are kept for the next log.
+        self._check_global_rows()
+
+    def test_disable_and_enable(self):
+        log_data = self._flow_log_data(self.sg2, event=log_const.ACCEPT_EVENT)
+        log_obj = self.log_plugin.create_log(self.ctxt, log_data)
+        self._check_sgrs_sampled(self.sg2rs, ovn_sampling.STAGES)
+        self.assertEqual([], self._sg_drop_acls(self.sg2))
+
+        log_data['log']['enabled'] = False
+        self.log_plugin.update_log(self.ctxt, log_obj['id'], log_data)
+        self._check_sgrs_sampled(self.sg2rs, ())
+
+        log_data['log']['enabled'] = True
+        self.log_plugin.update_log(self.ctxt, log_obj['id'], log_data)
+        self._check_sgrs_sampled(self.sg2rs, ovn_sampling.STAGES)
+
+    def test_drop_acls_shared_with_packet_log(self):
+        packet_data = self._log_data(sg_id=self.sg3)
+        packet_data['log']['event'] = log_const.DROP_EVENT
+        packet_log = self.log_plugin.create_log(self.ctxt, packet_data)
+        flow_log = self.log_plugin.create_log(
+            self.ctxt, self._flow_log_data(self.sg3,
+                                           event=log_const.DROP_EVENT))
+        drop_acls = self._sg_drop_acls(self.sg3)
+        self.assertEqual(2, len(drop_acls))
+        for acl in drop_acls:
+            self.assertTrue(acl.log)
+            self._check_acl_sampled(acl, (ovn_sampling.STAGE_NEW,))
+            # The label of a logged and sampled ACL is its Sample metadata.
+            self.assertEqual(
+                ovn_sampling.referenced_sample(
+                    acl, ovn_sampling.STAGE_NEW).metadata, acl.label)
+        self._check_sgrs_sampled(self.sg3rs, ())
+
+        self.log_plugin.delete_log(self.ctxt, packet_log['id'])
+        drop_acls = self._sg_drop_acls(self.sg3)
+        self.assertEqual(2, len(drop_acls))
+        for acl in drop_acls:
+            self.assertFalse(acl.log)
+            self._check_acl_sampled(acl, (ovn_sampling.STAGE_NEW,))
+
+        self.log_plugin.delete_log(self.ctxt, flow_log['id'])
+        self.assertEqual([], self._sg_drop_acls(self.sg3))
+
+    def test_foreign_reference_is_rejected(self):
+        acl = self._find_security_group_rule_row_by_id(self.sg2rs[0])
+        # A Sample row is garbage collected unless an ACL references it in
+        # the transaction that creates it.
+        with self.nb_api.transaction(check_error=True) as txn:
+            collector = txn.add(self.nb_api.db_create(
+                'Sample_Collector', id=200, name='foreign', probability=1,
+                set_id=7))
+            sample = txn.add(self.nb_api.db_create(
+                'Sample', metadata=4242, collectors=[collector]))
+            txn.add(self.nb_api.db_set('ACL', acl.uuid,
+                                       ('sample_new', [sample])))
+        foreign_sample = sample.result
+
+        self.assertRaises(n_exc.DriverCallError, self.log_plugin.create_log,
+                          self.ctxt, self._flow_log_data(self.sg2))
+        acl = self._find_security_group_rule_row_by_id(self.sg2rs[0])
+        self.assertEqual([foreign_sample], [s.uuid for s in acl.sample_new])
+
+    def test_sampling_disabled_is_rejected(self):
+        cfg.CONF.set_override('ovn_acl_sampling', False, group='network_log')
+        self.assertRaises(log_exc.LogOutputTypeNotSupported,
+                          self.log_plugin.create_log, self.ctxt,
+                          self._flow_log_data(self.sg1))
+        self.assertEqual([], self._rows('Sampling_App'))
+
+    def test_selector_is_validated(self):
+        self.assertRaises(log_exc.FlowSampleSelectorNotSupported,
+                          self.log_plugin.create_log, self.ctxt,
+                          self._flow_log_data(None))
+        log_data = self._flow_log_data(self.sg1)
+        log_data['log']['target_id'] = self.port1
+        self.assertRaises(log_exc.FlowSampleSelectorNotSupported,
+                          self.log_plugin.create_log, self.ctxt, log_data)
+
+    def test_loggable_resources_advertise_output_types(self):
+        resources = self.log_plugin.get_loggable_resources(self.ctxt)
+        self.assertIn({'type': log_const.SECURITY_GROUP,
+                       'output_types': [output_apidef.FLOW_SAMPLE,
+                                        output_apidef.PACKET_LOG]},
+                      resources)
+        cfg.CONF.set_override('ovn_acl_sampling', False, group='network_log')
+        resources = self.log_plugin.get_loggable_resources(self.ctxt)
+        self.assertIn({'type': log_const.SECURITY_GROUP,
+                       'output_types': [output_apidef.PACKET_LOG]},
+                      resources)

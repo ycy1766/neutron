@@ -15,6 +15,7 @@
 
 from unittest import mock
 
+from neutron_lib.api.definitions import logging_output_type as output_apidef
 from neutron_lib import context
 from neutron_lib.plugins import constants as plugin_const
 from neutron_lib.plugins import directory
@@ -25,6 +26,7 @@ from neutron import manager
 from neutron.objects.logapi import logging_resource as log_object
 from neutron.objects import ports
 from neutron.objects import securitygroup as sg_object
+from neutron import policy
 from neutron.services.logapi.common import exceptions as log_exc
 from neutron.services.logapi.common import sg_validate
 from neutron.tests.unit.services.logapi import base
@@ -123,6 +125,132 @@ class TestLoggingPlugin(base.BaseLogTestCase):
                             mock.call.call('create_log', self.ctxt, new_log)
                         ]
                         self.log_plugin.driver_manager.assert_has_calls(calls)
+
+    def _flow_sample_log(self, **kwargs):
+        log = {'resource_type': 'security_group',
+               'enabled': True,
+               'resource_id': uuidutils.generate_uuid(),
+               'output_type': output_apidef.FLOW_SAMPLE}
+        log.update(kwargs)
+        return {'log': log}
+
+    def _create_flow_sample_log(self, log):
+        new_log = mock.Mock()
+        with mock.patch.object(sg_object.SecurityGroup, 'count',
+                               return_value=1):
+            with mock.patch('neutron.objects.logapi.'
+                            'logging_resource.Log',
+                            return_value=new_log):
+                self.log_plugin.create_log(self.ctxt, log)
+        return new_log
+
+    def test_create_flow_sample_log(self):
+        self.log_plugin.driver_manager.supported_output_types.return_value = {
+            output_apidef.PACKET_LOG, output_apidef.FLOW_SAMPLE}
+        new_log = self._create_flow_sample_log(self._flow_sample_log())
+        self.assertTrue(new_log.create.called)
+        self.log_plugin.driver_manager.supported_output_types.\
+            assert_called_once_with('security_group')
+        calls = [mock.call.call('create_log_precommit', self.ctxt, new_log),
+                 mock.call.call('create_log', self.ctxt, new_log)]
+        self.log_plugin.driver_manager.assert_has_calls(calls)
+
+    def test_create_flow_sample_log_unsupported_output(self):
+        self.log_plugin.driver_manager.supported_output_types.return_value = {
+            output_apidef.PACKET_LOG}
+        self.assertRaises(log_exc.LogOutputTypeNotSupported,
+                          self._create_flow_sample_log,
+                          self._flow_sample_log())
+        self.log_plugin.driver_manager.call.assert_not_called()
+
+    def test_create_flow_sample_log_without_resource_id(self):
+        self.assertRaises(log_exc.FlowSampleSelectorNotSupported,
+                          self._create_flow_sample_log,
+                          self._flow_sample_log(resource_id=None))
+        self.log_plugin.driver_manager.call.assert_not_called()
+
+    def test_create_flow_sample_log_with_target(self):
+        log = self._flow_sample_log(target_id=uuidutils.generate_uuid())
+        port = mock.Mock()
+        with mock.patch.object(ports.Port, 'get_object', return_value=port):
+            with mock.patch('neutron.services.logapi.common.'
+                            'validators.validate_log_type_for_port',
+                            return_value=True):
+                with mock.patch('neutron_lib.db.utils.model_query'):
+                    self.assertRaises(log_exc.FlowSampleSelectorNotSupported,
+                                      self._create_flow_sample_log, log)
+        self.log_plugin.driver_manager.call.assert_not_called()
+
+    def test_update_log_enable_flow_sample(self):
+        self.log_plugin.driver_manager.supported_output_types.return_value = {
+            output_apidef.PACKET_LOG, output_apidef.FLOW_SAMPLE}
+        log_data = {'log': {'enabled': True}}
+        stored = mock.Mock(project_id='fake_project',
+                           enabled=False,
+                           resource_type='security_group',
+                           resource_id=uuidutils.generate_uuid(),
+                           target_id=None,
+                           output_type=output_apidef.FLOW_SAMPLE)
+        stored.id = uuidutils.generate_uuid()
+        new_log = mock.Mock()
+        with mock.patch.object(policy, 'enforce') as enforce:
+            with mock.patch('neutron.objects.logapi.'
+                            'logging_resource.Log',
+                            return_value=new_log) as log_cls:
+                log_cls.get_object.return_value = stored
+                self.log_plugin.update_log(self.ctxt, stored.id, log_data)
+        enforce.assert_called_once_with(
+            self.ctxt, 'create_log:output_type',
+            {'project_id': 'fake_project'})
+        self.assertTrue(new_log.update.called)
+        self.log_plugin.driver_manager.call.assert_any_call(
+            'update_log', self.ctxt, new_log)
+
+    def test_update_log_enable_flow_sample_no_longer_supported(self):
+        self.log_plugin.driver_manager.supported_output_types.return_value = {
+            output_apidef.PACKET_LOG}
+        stored = mock.Mock(project_id='fake_project',
+                           enabled=False,
+                           resource_type='security_group',
+                           resource_id=uuidutils.generate_uuid(),
+                           target_id=None,
+                           output_type=output_apidef.FLOW_SAMPLE)
+        stored.id = uuidutils.generate_uuid()
+        with mock.patch.object(log_object.Log, 'get_object',
+                               return_value=stored):
+            with mock.patch.object(policy, 'enforce'):
+                self.assertRaises(log_exc.LogOutputTypeNotSupported,
+                                  self.log_plugin.update_log, self.ctxt,
+                                  stored.id, {'log': {'enabled': True}})
+        self.log_plugin.driver_manager.call.assert_not_called()
+
+    def test_update_log_flow_sample_already_enabled(self):
+        # Updating an enabled log does not validate it again, so that it
+        # can be updated after its output is no longer available.
+        self.log_plugin.driver_manager.supported_output_types.return_value = {
+            output_apidef.PACKET_LOG}
+        stored = mock.Mock(project_id='fake_project', enabled=True,
+                           output_type=output_apidef.FLOW_SAMPLE)
+        stored.id = uuidutils.generate_uuid()
+        new_log = mock.Mock()
+        with mock.patch.object(policy, 'enforce') as enforce:
+            with mock.patch('neutron.objects.logapi.'
+                            'logging_resource.Log',
+                            return_value=new_log) as log_cls:
+                log_cls.get_object.return_value = stored
+                self.log_plugin.update_log(self.ctxt, stored.id,
+                                           {'log': {'enabled': True}})
+        enforce.assert_not_called()
+        self.assertTrue(new_log.update.called)
+
+    def test_get_loggable_resources(self):
+        self.log_plugin.driver_manager.supported_output_types.return_value = {
+            output_apidef.FLOW_SAMPLE, output_apidef.PACKET_LOG}
+        self.assertEqual(
+            [{'type': 'security_group',
+              'output_types': [output_apidef.FLOW_SAMPLE,
+                               output_apidef.PACKET_LOG]}],
+            self.log_plugin.get_loggable_resources(self.ctxt))
 
     def test_create_log_without_sg_resource(self):
         log = {'log': {'resource_type': 'security_group',

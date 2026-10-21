@@ -13,6 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from neutron_lib.api.definitions import logging_output_type as output_apidef
 from neutron_lib import constants as const
 from neutron_lib.db import api as db_api
 from neutron_lib.services.logapi import constants
@@ -167,14 +168,18 @@ def _make_log_dict(context, sg_log, port_ids_log):
 
 
 def get_logs_bound_port(context, port_id):
-    """Return a list of log_resources bound to a port"""
+    """Return a list of packet log resources bound to a port
+
+    The agents pulling this information apply packet logging only.
+    """
 
     port = port_objects.Port.get_object(context, id=port_id)
     project_id = port['project_id']
     logs = log_object.Log.get_objects(context,
                                       project_id=project_id,
                                       resource_type=constants.SECURITY_GROUP,
-                                      enabled=True)
+                                      enabled=True,
+                                      output_type=output_apidef.PACKET_LOG)
 
     def _is_bound(log):
         return (log.resource_id in port.security_group_ids or

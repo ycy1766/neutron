@@ -74,3 +74,13 @@ class EventsDisabled(n_exc.InvalidInput):
 
 class RouterGatewayNotSet(n_exc.NeutronException):
     message = _('Router gateway is not set for router %(resource_id)s.')
+
+
+class LogOutputTypeNotSupported(n_exc.InvalidInput):
+    message = _('Log output type %(output_type)s is not supported for '
+                '%(resource_type)s by the loaded logging drivers.')
+
+
+class FlowSampleSelectorNotSupported(n_exc.InvalidInput):
+    message = _('A log with the flow_sample output must select a security '
+                'group with resource_id and must not set target_id.')

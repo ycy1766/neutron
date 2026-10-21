@@ -130,6 +130,98 @@ Just as with ML2/OVS, we can enable or disable logging objects at runtime. If
 we have two objects targeted to log the same resource, as long as one of them
 is enabled, the resource will be logged on the logfile.
 
+Flow sampling
+~~~~~~~~~~~~~
+
+The ``logging-output-type`` API extension adds the ``output_type`` attribute
+to the log resource. The default, ``packet_log``, is the packet logging
+described above. The ``flow_sample`` output asks the ML2/OVN driver to attach
+OVN Samples to the ACLs of the selected security group instead, so that OVN
+emits IPFIX samples of the accepted and dropped traffic of that security group
+through the OVS flow-based IPFIX exporter. The samples can be collected and
+aggregated into flow records by an external collector.
+
+Flow sampling is disabled by default. To enable it, configure the identifiers
+of the OVN sampling rows that Neutron will own in the ``[network_log]``
+section of ``ml2_conf.ini`` and restart neutron-server:
+
+.. code-block:: ini
+
+   [network_log]
+   ovn_acl_sampling = True
+   ovn_acl_sampling_app_new_id = 11
+   ovn_acl_sampling_app_est_id = 12
+   ovn_acl_sampling_collector_id = 13
+   ovn_acl_sampling_collector_set_id = 1000
+   ovn_acl_sampling_probability = 65535
+
+Neutron creates one ``Sampling_App`` row per connection stage (``acl-new``
+and ``acl-est``) and one ``Sample_Collector`` row in the OVN Northbound
+database, marked with ``neutron:device_owner=logging-plugin``. Rows with the
+same application type, application ID or collector ID that are not owned by
+Neutron are never adopted; a request that needs them fails with HTTP 409.
+The probability applies to every sampled ACL and is expressed as N/65535.
+
+The OVS side is configured by the operator. On every chassis, a
+``Flow_Sample_Collector_Set`` row with the configured set ID must point the
+samples to the IPFIX collector, for example:
+
+.. code-block:: console
+
+   $ ovs-vsctl -- --id=@ipfix create IPFIX targets=\"192.0.2.10:4739\" \
+     -- --id=@br get Bridge br-int \
+     -- create Flow_Sample_Collector_Set id=1000 bridge=@br ipfix=@ipfix
+
+The ``loggable-resources`` request lists the outputs supported for each
+resource type. ``flow_sample`` is only advertised when sampling is enabled,
+the ML2/OVN logging driver is loaded and the OVN Northbound schema supports
+ACL sampling (OVN 24.09 or newer):
+
+.. code-block:: console
+
+   $ openstack network loggable resources list --long
+   +-----------------+--------------------------+
+   | Supported types | Supported output types   |
+   +-----------------+--------------------------+
+   | security_group  | ['packet_log', 'flow_sample'] |
+   +-----------------+--------------------------+
+
+Create a flow-sample log by selecting a security group:
+
+.. code-block:: console
+
+   $ openstack network log create --resource-type security_group \
+     --resource sg1 --event ALL --output-type flow_sample samples1
+
+The following restrictions apply to the ``flow_sample`` output:
+
+* The log must select a security group with ``--resource``; ``--target`` is
+  rejected. OVN samples every port of the security group's port group, not a
+  single port.
+* Creating or enabling such a log requires the ``create_log:output_type``
+  policy, which defaults to administrators, because a shared security group
+  can contain the ports of other projects.
+* The output of a log cannot be changed. Create a replacement log instead.
+* Using enabled ``packet_log`` and ``flow_sample`` logs concurrently on the
+  same security group is not supported. The API does not reject this
+  combination; operators must ensure that only one output type is enabled
+  for a given security group. Disable or delete the old log before enabling
+  a replacement with a different output type. Multiple logs of the same
+  output type are supported. All packet logs of a security group share the
+  label of its ACLs; existing connections can retain earlier conntrack
+  metadata when the logging configuration changes.
+* The per-security-group drop ACLs are shared by both outputs: a
+  ``flow_sample`` log with the ``DROP`` or ``ALL`` event creates them without
+  packet logging, and they are kept while any enabled log of either output
+  still needs them.
+
+The IPFIX records carry the observation domain ID, whose upper 8 bits are the
+``Sampling_App`` ID of the stage and whose lower 24 bits are the OVN datapath
+tunnel key, and the observation point ID, which is the metadata of the Sample
+of the security group, stage and verdict. A collector can map them back to
+the security group through the ``neutron:sample_new_metadata`` and
+``neutron:sample_est_metadata`` keys recorded on the ACLs.
+
 
 Understanding the logging
 ~~~~~~~~~~~~~~~~~~~~~~~~~
