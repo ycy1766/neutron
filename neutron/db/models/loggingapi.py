@@ -13,6 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from neutron_lib.api.definitions import logging_output_type as output_apidef
 from neutron_lib.db import constants as db_const
 from neutron_lib.db import model_base
 from neutron_lib.db import standard_attr
@@ -33,4 +34,6 @@ class Log(standard_attr.HasStandardAttributes, model_base.BASEV2,
     target_id = sa.Column(sa.String(db_const.UUID_FIELD_SIZE),
                           nullable=True, index=True)
     enabled = sa.Column(sa.Boolean())
+    output_type = sa.Column(sa.String(16), nullable=False,
+                            server_default=output_apidef.PACKET_LOG)
     api_collections = ['logs']

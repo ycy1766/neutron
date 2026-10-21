@@ -42,6 +42,12 @@ class SystemAdminTests(LoggingAPITestCase):
             base_policy.InvalidScope,
             policy.enforce, self.context, 'create_log', self.target)
 
+    def test_create_log_output_type(self):
+        self.assertRaises(
+            base_policy.InvalidScope,
+            policy.enforce, self.context, 'create_log:output_type',
+            self.target)
+
     def test_get_log(self):
         self.assertRaises(
             base_policy.InvalidScope,
@@ -86,6 +92,11 @@ class AdminTests(LoggingAPITestCase):
         self.assertTrue(
             policy.enforce(self.context, 'create_log', self.target))
 
+    def test_create_log_output_type(self):
+        self.assertTrue(
+            policy.enforce(self.context, 'create_log:output_type',
+                           self.target))
+
     def test_get_log(self):
         self.assertTrue(
             policy.enforce(self.context, 'get_log', self.target))
@@ -112,6 +123,12 @@ class ProjectManagerTests(AdminTests):
     def test_create_log(self):
         self.assertTrue(
             policy.enforce(self.context, 'create_log', self.target))
+
+    def test_create_log_output_type(self):
+        self.assertRaises(
+            base_policy.PolicyNotAuthorized,
+            policy.enforce, self.context, 'create_log:output_type',
+            self.target)
 
     def test_get_log(self):
         self.assertTrue(
@@ -180,6 +197,12 @@ class ServiceRoleTests(LoggingAPITestCase):
         self.assertRaises(
             base_policy.PolicyNotAuthorized,
             policy.enforce, self.context, 'create_log', self.target)
+
+    def test_create_log_output_type(self):
+        self.assertRaises(
+            base_policy.PolicyNotAuthorized,
+            policy.enforce, self.context, 'create_log:output_type',
+            self.target)
 
     def test_get_log(self):
         self.assertRaises(
