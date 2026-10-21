@@ -49,6 +49,12 @@ log_cfg.register_ovn_acl_sampling_opts()
 
 MAX_INT_LABEL = 2**32
 SUPPORTED_LOGGING_TYPES = (log_const.SECURITY_GROUP,)
+# Attempts of a sampling transaction when two servers allocate the same
+# Sample metadata at the same time.
+SAMPLING_TXN_ATTEMPTS = 3
+# Extra sampling transactions when the stored logs changed while one was
+# committed.
+SAMPLING_RECHECKS = 2
 
 OUTPUT_PACKET_LOG = output_apidef.PACKET_LOG
 OUTPUT_FLOW_SAMPLE = output_apidef.FLOW_SAMPLE
@@ -642,6 +648,67 @@ class OVNDriver(base.DriverBase):
             raise log_exc.FlowSampleSelectorNotSupported()
         self._check_flow_sampling_available()
 
+    def reconcile_sampling(self, context, sg_ids=None, periodic=False):
+        """Converge the sampling of security groups with flow-sample logs.
+
+        Used by the maintenance task and the OVN DB sync tool to repair
+        references lost to ACL replacement, missed notifications or
+        failed transactions, to detach the sampling of logs that remain
+        enabled after the operator disabled it, and to remove the sampling
+        left on security groups whose logs no longer exist.
+
+        :param sg_ids: the security groups to reconcile; if not given, all
+            the security groups selected by a flow-sample log and all those
+            whose Port Group still carries Neutron sampling state.
+        :param periodic: report the ACL references that are not managed by
+            Neutron at debug level, since a periodic caller would repeat
+            the report at every run.
+        :returns: the list of reconciled security group IDs.
+        """
+        if (self._log_plugin is None or
+                not self._sampling_schema_supported()):
+            return []
+        if sg_ids is None:
+            sg_ids = {lo.resource_id for lo in
+                      self._get_flow_sample_logs(context.elevated())
+                      if lo.resource_id}
+            sg_ids |= self._sg_ids_with_sampling_state()
+        sg_ids = sorted(sg_ids)
+        if sg_ids:
+            self._sync_sg_sampling(context, sg_ids, prune_drop_acls=True,
+                                   quiet_conflicts=periodic)
+        return sg_ids
+
+    @staticmethod
+    def _is_unlogged_drop_acl(acl):
+        """Return True for a per-SG drop ACL without packet logging.
+
+        Such an ACL is created for the drops of a flow-sample log; a packet
+        log enables the logging of the drop ACLs it requires.
+        """
+        return (acl.priority == ovn_const.ACL_PRIORITY_LOG_DROP and
+                acl.action == ovn_const.ACL_ACTION_DROP and
+                not acl.log)
+
+    def _sg_ids_with_sampling_state(self):
+        """Return the security groups whose Port Group carries sampling.
+
+        A Port Group carries Neutron sampling state when one of its ACLs
+        has a Sample metadata recorded by Neutron or is a per-SG drop ACL
+        without packet logging.
+        """
+        sg_ids = set()
+        for pg in self.ovn_nb.db_list_rows('Port_Group').execute(
+                check_error=True):
+            sg_id = pg.external_ids.get(ovn_const.OVN_SG_EXT_ID_KEY)
+            if sg_id and any(
+                    self._is_unlogged_drop_acl(acl) or
+                    any(ovn_sampling.recorded_metadata(acl, stage)
+                        for stage in ovn_sampling.STAGES)
+                    for acl in pg.acls):
+                sg_ids.add(sg_id)
+        return sg_ids
+
     def sync_security_group_sampling(self, context, sg_id, txn):
         """Reapply the sampling of a security group whose ACLs changed.
 
@@ -651,6 +718,23 @@ class OVNDriver(base.DriverBase):
         """
         self._sync_sg_sampling(context, [sg_id], only_if_sampled=True,
                                txn=txn)
+
+    def resync_security_group_sampling(self, context, sg_id):
+        """Check the sampling of a security group after a transaction.
+
+        Called by the ML2/OVN mechanism driver after the transaction in
+        which sync_security_group_sampling added the sampling of the
+        replaced ACLs has committed. The IDL retries a conflicting
+        transaction with the commands built from the logs read before, so
+        the sampling is converged again from the stored logs, in a
+        transaction of its own that checks them once more after it
+        commits. A failure is logged rather than raised.
+        """
+        try:
+            self._sync_sg_sampling(context, [sg_id])
+        except Exception:
+            LOG.exception("Failed to reapply OVN ACL sampling for security "
+                          "group %s", sg_id)
 
     def _sampling_sg_ids_for_log(self, context, log_obj):
         """Return the security groups whose ACLs a log object can modify."""
@@ -677,7 +761,8 @@ class OVNDriver(base.DriverBase):
 
     def _sync_sg_sampling(self, context, sg_ids, only_if_sampled=False,
                           remove_unused_drop_acls_for=None, strict=False,
-                          txn=None):
+                          txn=None, prune_drop_acls=False,
+                          quiet_conflicts=False):
         """Converge the OVN ACL sampling of security groups.
 
         The desired state of each security group is the union of its
@@ -689,14 +774,21 @@ class OVNDriver(base.DriverBase):
             flow-sample log; used after packet logging changes that may
             recreate sampled ACLs.
         :param remove_unused_drop_acls_for: a disabled or deleted
-            flow-sample log; its per-SG drop ACLs are removed if no other
-            enabled log, of either output, still requires them.
+            flow-sample log; its per-SG drop ACLs without packet logging are
+            removed if no other enabled log, of either output, still
+            requires them. An ACL that references a Sample not managed by
+            Neutron is kept.
         :param strict: fail with a conflict instead of a warning when a
             required ACL reference is not managed by Neutron; used for API
             requests that enable sampling.
         :param txn: an open Northbound transaction to add the commands to.
             When given, the caller commits it and conflicts are not
             reported.
+        :param prune_drop_acls: remove the per-SG drop ACLs without packet
+            logging that no enabled log, of either output, requires; used
+            by the reconciliation.
+        :param quiet_conflicts: report the ACL references that are not
+            managed by Neutron at debug level instead of warning.
         """
         sg_ids = sorted({sg_id for sg_id in sg_ids if sg_id})
         if not sg_ids or not self._sampling_schema_supported():
@@ -716,33 +808,31 @@ class OVNDriver(base.DriverBase):
             if not sg_ids:
                 return
 
-        actions_by_sg = collections.defaultdict(set)
-        drop_acls_needed = set()
-        if config is not None:
-            for lo in flow_logs:
-                if not lo.enabled:
-                    continue
-                actions_by_sg[lo.resource_id] |= self._acl_actions_enabled(lo)
-                if lo.event in DROP_LOG_EVENTS:
-                    drop_acls_needed.add(lo.resource_id)
+        def plan(flow_logs):
+            return self._sampling_plan(context, sg_ids, config, flow_logs,
+                                       remove_unused_drop_acls_for,
+                                       prune_drop_acls)
 
-        removed_log = remove_unused_drop_acls_for
-        remove_drop_acls = (
-            removed_log is not None and
-            removed_log.event in DROP_LOG_EVENTS and
-            removed_log.resource_id not in drop_acls_needed and
-            not self._get_other_sg_drop_logs(context, removed_log))
+        plans = [plan(flow_logs)]
+        applied = []
 
         def add_commands(ovn_txn):
+            # A retried transaction recomputes the desired state from the
+            # stored logs, which can have changed in the meantime.
+            if plans:
+                current = plans.pop()
+            else:
+                current = plan(self._get_flow_sample_logs(
+                    context, resource_id=sg_ids))
+            applied.append(current)
+            actions_by_sg, drop_acls_needed, prunable = current
             set_cmds = {}
             if any(actions_by_sg.values()):
                 ovn_txn.add(self.ovn_nb.ensure_acl_sampling_resources(config))
-            if remove_drop_acls:
-                self._remove_sg_drop_acls(context, removed_log, ovn_txn)
             for sg_id in sg_ids:
                 pg_name = utils.ovn_port_group_name(sg_id)
-                if self.ovn_nb.lookup('Port_Group', pg_name,
-                                      default=None) is None:
+                pg = self.ovn_nb.lookup('Port_Group', pg_name, default=None)
+                if pg is None:
                     LOG.info("Port Group %s not found, skipping its ACL "
                              "sampling", pg_name)
                     continue
@@ -755,22 +845,105 @@ class OVNDriver(base.DriverBase):
                     self.ovn_nb.set_port_group_acl_sampling(
                         pg_name, actions_by_sg[sg_id],
                         config.collector_id if config else None,
-                        raise_on_conflict=strict))
+                        raise_on_conflict=strict,
+                        remove_unlogged_drop_acls=sg_id in prunable))
             return set_cmds
 
         if txn is not None:
             add_commands(txn)
             return
-        with self.ovn_nb.transaction(check_error=True) as ovn_txn:
-            set_cmds = add_commands(ovn_txn)
+        set_cmds = self._commit_sampling(add_commands)
+        # The IDL retries a transaction that conflicts with a concurrent
+        # Northbound change by running the same commands, which carry the
+        # logs read before. Another server can have changed the logs and
+        # their sampling meanwhile, so check the stored logs again and
+        # converge once more if they no longer match what was applied.
+        for _recheck in range(SAMPLING_RECHECKS):
+            fresh = plan(self._get_flow_sample_logs(
+                context, resource_id=sg_ids))
+            if self._plan_key(fresh) == self._plan_key(applied[-1]):
+                break
+            LOG.debug("The flow-sample logs of security groups %s changed "
+                      "while their sampling was applied, applying it again",
+                      sg_ids)
+            plans.append(fresh)
+            set_cmds = self._commit_sampling(add_commands)
 
+        report = LOG.debug if quiet_conflicts else LOG.warning
         for sg_id, cmd in set_cmds.items():
             result = getattr(cmd, 'result', None)
             if isinstance(result, dict) and result.get('conflicts'):
-                LOG.warning("Security group %(sg)s has ACL sample references "
-                            "that are not managed by Neutron and were left "
-                            "unchanged: %(conflicts)s",
-                            {'sg': sg_id, 'conflicts': result['conflicts']})
+                report("Security group %(sg)s has ACL sample references "
+                       "that are not managed by Neutron and were left "
+                       "unchanged: %(conflicts)s",
+                       {'sg': sg_id, 'conflicts': result['conflicts']})
+
+    @staticmethod
+    def _plan_key(plan):
+        """Return the part of a sampling plan that determines its result."""
+        actions_by_sg, drop_acls_needed, prunable = plan
+        return ({sg_id: frozenset(actions)
+                 for sg_id, actions in actions_by_sg.items() if actions},
+                frozenset(drop_acls_needed), frozenset(prunable))
+
+    def _sampling_plan(self, context, sg_ids, config, flow_logs, removed_log,
+                       prune_drop_acls):
+        """Compute the desired sampling state of security groups.
+
+        :returns: a tuple of the sampled ACL actions of each security
+            group, the security groups that need drop ACLs for sampling,
+            and the security groups whose drop ACLs without packet logging
+            are to be removed. They are removed for the security group of
+            a disabled or deleted DROP or ALL log, and for every security
+            group with ``prune_drop_acls``, when no enabled log of either
+            output requires them.
+        """
+        actions_by_sg = collections.defaultdict(set)
+        drop_acls_needed = set()
+        if config is not None:
+            for lo in flow_logs:
+                if not lo.enabled:
+                    continue
+                actions_by_sg[lo.resource_id] |= self._acl_actions_enabled(lo)
+                if lo.event in DROP_LOG_EVENTS:
+                    drop_acls_needed.add(lo.resource_id)
+
+        prunable = set()
+        if (removed_log is not None and
+                removed_log.event in DROP_LOG_EVENTS and
+                removed_log.resource_id not in drop_acls_needed and
+                not self._get_other_sg_drop_logs(context, removed_log)):
+            prunable.add(removed_log.resource_id)
+        if prune_drop_acls:
+            for sg_id in sg_ids:
+                if sg_id in drop_acls_needed or sg_id in prunable:
+                    continue
+                selector = self._log_dict_to_obj(
+                    {'id': None, 'resource_id': sg_id, 'target_id': None})
+                if not any(not is_flow_sample_log(lo) for lo in
+                           self._get_other_sg_drop_logs(context, selector)):
+                    prunable.add(sg_id)
+        return actions_by_sg, drop_acls_needed, prunable
+
+    def _commit_sampling(self, add_commands):
+        """Commit sampling commands, retrying a Sample identifier race.
+
+        Sample metadata values are chosen from the rows visible to this
+        server. Another server can insert the same value first, which the
+        Northbound index rejects; the next attempt sees the new row.
+        """
+        for attempt in range(1, SAMPLING_TXN_ATTEMPTS + 1):
+            try:
+                with self.ovn_nb.transaction(check_error=True) as ovn_txn:
+                    result = add_commands(ovn_txn)
+                return result
+            except RuntimeError as exc:
+                if ('constraint violation' not in str(exc) or
+                        attempt == SAMPLING_TXN_ATTEMPTS):
+                    raise
+                LOG.info("Retrying OVN ACL sampling transaction after a "
+                         "constraint violation (attempt %d): %s",
+                         attempt, exc)
 
     def add_logging_options_to_acls(self, neutron_acls, context):
         log_objs = self._get_packet_logs(context)

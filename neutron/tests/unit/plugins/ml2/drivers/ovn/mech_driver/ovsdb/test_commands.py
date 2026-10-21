@@ -1454,6 +1454,12 @@ class _SamplingRow:
     def delkey(self, column, key):
         getattr(self, column).pop(key, None)
 
+    def delvalue(self, column, value):
+        getattr(self, column).remove(value)
+
+    def delete(self):
+        self.deleted = True
+
 
 class _SamplingTable:
     def __init__(self):
@@ -1596,9 +1602,11 @@ class TestSetPortGroupAclSamplingCommand(TestSamplingCommandBase):
         self.pg.acls.append(acl)
         return acl
 
-    def _run(self, actions, collector_id=13, port_group='pg_sg1'):
+    def _run(self, actions, collector_id=13, port_group='pg_sg1',
+             remove_unlogged_drop_acls=False):
         cmd = commands.SetPortGroupAclSamplingCommand(
-            self.nb, port_group, actions, collector_id)
+            self.nb, port_group, actions, collector_id,
+            remove_unlogged_drop_acls=remove_unlogged_drop_acls)
         cmd.run_idl(self.txn)
         return cmd.result
 
@@ -1793,6 +1801,49 @@ class TestSetPortGroupAclSamplingCommand(TestSamplingCommandBase):
         self.pg.acls.append(acl)
         self._run({ovn_const.ACL_ACTION_DROP})
         self.assertIsNotNone(self._md(acl, 'new'))
+
+    def _sg_drop_acl(self, log=False):
+        return self._acl(ovn_const.ACL_ACTION_DROP, log=log,
+                         priority=ovn_const.ACL_PRIORITY_LOG_DROP)
+
+    def test_remove_unlogged_drop_acls(self):
+        unlogged = self._sg_drop_acl()
+        owned = self._sg_drop_acl()
+        sample = self._owned_sample(5)
+        self._make_owned(owned, 'new', sample)
+        logged = self._sg_drop_acl(log=True)
+        rule = self._acl(ovn_const.ACL_ACTION_DROP, priority=1002)
+        result = self._run(set(), collector_id=None,
+                           remove_unlogged_drop_acls=True)
+        self.assertEqual([logged, rule], self.pg.acls)
+        self.assertTrue(unlogged.deleted)
+        self.assertTrue(owned.deleted)
+        self.assertFalse(hasattr(logged, 'deleted'))
+        self.assertEqual(0, result['detached'])
+        # The decision is guarded against concurrent changes.
+        for column in ('log', 'external_ids', 'sample_new', 'sample_est'):
+            self.assertIn(column, unlogged.verified)
+        self.assertEqual({'metadata', 'collectors'}, sample.verified)
+        self.assertIn('acls', self.pg.verified)
+
+    def test_remove_unlogged_drop_acls_keeps_foreign_reference(self):
+        acl = self._sg_drop_acl()
+        foreign_collector = self._add('Sample_Collector', id=200,
+                                      external_ids={})
+        foreign = self._add('Sample', metadata=77,
+                            collectors=[foreign_collector])
+        acl.sample_new = [foreign]
+        result = self._run(set(), collector_id=None,
+                           remove_unlogged_drop_acls=True)
+        self.assertEqual([acl], self.pg.acls)
+        self.assertFalse(hasattr(acl, 'deleted'))
+        self.assertEqual([(acl.uuid, 'new')], result['conflicts'])
+        self.assertEqual([foreign], acl.sample_new)
+
+    def test_unlogged_drop_acls_kept_by_default(self):
+        acl = self._sg_drop_acl()
+        self._run(set(), collector_id=None)
+        self.assertEqual([acl], self.pg.acls)
 
     def test_missing_collector(self):
         self._acl(ovn_const.ACL_ACTION_DROP)

@@ -633,6 +633,7 @@ class TestOVNDriverFlowSample(TestOVNDriverBase):
         self.txn.add.side_effect = lambda cmd: cmd
         self.logs = []
         self.log_plugin.get_logs.side_effect = self._get_logs
+        self._nb_ovn.db_list_rows.return_value.execute.return_value = []
         mock.patch.object(db_api, '_get_ports_attached_to_sg',
                           return_value=[]).start()
 
@@ -833,12 +834,26 @@ class TestOVNDriverFlowSample(TestOVNDriverBase):
                 enabled=True, event=log_const.ALL_EVENT)),
             actions)
 
+    def _removes_drop_acls(self):
+        return self._nb_ovn.set_port_group_acl_sampling.call_args.kwargs[
+            'remove_unlogged_drop_acls']
+
     def test_update_log_disable_removes_unused_drop_acls(self):
+        # The sampling command removes them, keeping an ACL that references
+        # a Sample not managed by Neutron.
         log_obj = self._log(event=log_const.DROP_EVENT, enabled=False)
         self._log_driver.update_log(self.context, log_obj)
         self._nb_ovn.ensure_acl_sampling_resources.assert_not_called()
-        self.assertEqual(2, self._nb_ovn.pg_acl_del.call_count)
+        self._nb_ovn.pg_acl_del.assert_not_called()
+        self.assertTrue(self._removes_drop_acls())
         self.assertEqual((self.pg_name, set(), 13), self._set_call())
+
+    def test_delete_log_removes_unused_drop_acls(self):
+        log_obj = self._log(event=log_const.ALL_EVENT)
+        self.logs.pop()
+        self._log_driver.delete_log(self.context, log_obj)
+        self._nb_ovn.pg_acl_del.assert_not_called()
+        self.assertTrue(self._removes_drop_acls())
 
     def test_update_log_disable_keeps_drop_acls_for_packet_log(self):
         self._log(event=log_const.DROP_EVENT,
@@ -846,6 +861,23 @@ class TestOVNDriverFlowSample(TestOVNDriverBase):
         log_obj = self._log(event=log_const.DROP_EVENT, enabled=False)
         self._log_driver.update_log(self.context, log_obj)
         self._nb_ovn.pg_acl_del.assert_not_called()
+        self.assertFalse(self._removes_drop_acls())
+
+    def test_resync_security_group_sampling(self):
+        self._log()
+        self._log_driver.resync_security_group_sampling(self.context,
+                                                        self.sg_id)
+        self.assertEqual(1, self._nb_ovn.transaction.call_count)
+        self.assertEqual(self.pg_name, self._set_call()[0])
+
+    def test_resync_security_group_sampling_logs_failure(self):
+        self._log()
+        self._nb_ovn.transaction.return_value.__exit__.side_effect = (
+            RuntimeError('timeout'))
+        with mock.patch.object(ovn_driver.LOG, 'exception') as log_exc_:
+            self._log_driver.resync_security_group_sampling(self.context,
+                                                            self.sg_id)
+        log_exc_.assert_called_once()
 
     def test_update_log_enabled_with_sampling_disabled(self):
         # The plugin validates a log that is being enabled; an update of a
@@ -885,7 +917,8 @@ class TestOVNDriverFlowSample(TestOVNDriverBase):
         _pg_name, actions, _collector_id = self._set_call()
         self.assertNotIn(ovn_const.ACL_ACTION_DROP, actions)
         self.assertIn(ovn_const.ACL_ACTION_ALLOW_RELATED, actions)
-        self.assertEqual(2, self._nb_ovn.pg_acl_del.call_count)
+        # The remaining ACCEPT log does not need the drop ACLs.
+        self.assertTrue(self._removes_drop_acls())
 
     def test_packet_log_delete_resyncs_sampled_sg(self):
         self._log(event=log_const.DROP_EVENT)
@@ -906,6 +939,201 @@ class TestOVNDriverFlowSample(TestOVNDriverBase):
         with mock.patch.object(self._log_driver, '_delete_packet_log'):
             self._log_driver.delete_log(self.context, packet)
         self._nb_ovn.set_port_group_acl_sampling.assert_not_called()
+
+    def test_reconcile_sampling_all(self):
+        other_sg = uuidutils.generate_uuid()
+        self._log()
+        self._log(resource_id=other_sg, enabled=False)
+        sg_ids = self._log_driver.reconcile_sampling(self.context)
+        self.assertEqual(sorted([self.sg_id, other_sg]), sg_ids)
+        self.assertEqual(
+            2, self._nb_ovn.set_port_group_acl_sampling.call_count)
+
+    def test_reconcile_sampling_without_flow_logs(self):
+        self.assertEqual([], self._log_driver.reconcile_sampling(
+            self.context))
+        self._nb_ovn.set_port_group_acl_sampling.assert_not_called()
+
+    def test_reconcile_sampling_without_log_plugin(self):
+        self._log_driver._log_plugin_property = None
+        self.fake_get_dir_object.side_effect = lambda alias: None
+        self.assertEqual([], self._log_driver.reconcile_sampling(
+            self.context))
+        self._nb_ovn.set_port_group_acl_sampling.assert_not_called()
+
+    def _pg_row(self, sg_id, acls):
+        pg = mock.Mock(external_ids={ovn_const.OVN_SG_EXT_ID_KEY: sg_id},
+                       acls=acls)
+        pg.name = ovn_utils.ovn_port_group_name(sg_id)
+        return pg
+
+    @staticmethod
+    def _drop_acl(log=False):
+        return mock.Mock(priority=ovn_const.ACL_PRIORITY_LOG_DROP,
+                         action=ovn_const.ACL_ACTION_DROP, log=log,
+                         direction='from-lport', match='inport == @pg && ip',
+                         external_ids={})
+
+    def _set_pgs(self, *pgs):
+        self._nb_ovn.db_list_rows.return_value.execute.return_value = list(
+            pgs)
+        by_name = {pg.name: pg for pg in pgs}
+        self._nb_ovn.lookup.side_effect = (
+            lambda table, name, default=None: by_name.get(name, default))
+
+    def test_reconcile_sampling_detaches_sg_without_log(self):
+        # The log was deleted while its Sample references were kept.
+        sampled = mock.Mock(
+            priority=1002, action=ovn_const.ACL_ACTION_ALLOW_RELATED,
+            log=False, external_ids={ovn_sampling.STAGE_ACL_EXT_ID_KEY[
+                ovn_sampling.STAGE_NEW]: '42'})
+        plain = mock.Mock(priority=1002,
+                          action=ovn_const.ACL_ACTION_ALLOW_RELATED,
+                          log=False, external_ids={})
+        other_sg = uuidutils.generate_uuid()
+        self._set_pgs(self._pg_row(self.sg_id, [sampled]),
+                      self._pg_row(other_sg, [plain]))
+        self.assertEqual([self.sg_id],
+                         self._log_driver.reconcile_sampling(self.context))
+        pg_name, actions, _collector_id = self._set_call()
+        self.assertEqual(self.pg_name, pg_name)
+        self.assertEqual(set(), actions)
+
+    def _prunes(self):
+        return self._nb_ovn.set_port_group_acl_sampling.call_args.kwargs[
+            'remove_unlogged_drop_acls']
+
+    def test_reconcile_sampling_prunes_unlogged_drop_acls(self):
+        # The command removes the ACLs inside the transaction.
+        self._set_pgs(self._pg_row(self.sg_id, [self._drop_acl(),
+                                                self._drop_acl(True)]))
+        self.assertEqual([self.sg_id],
+                         self._log_driver.reconcile_sampling(self.context))
+        self.assertTrue(self._prunes())
+        self._nb_ovn.pg_acl_del.assert_not_called()
+
+    def test_reconcile_sampling_keeps_drop_acls_of_packet_log(self):
+        self._log(event=log_const.DROP_EVENT,
+                  output_type=ovn_driver.OUTPUT_PACKET_LOG)
+        self._set_pgs(self._pg_row(self.sg_id, [self._drop_acl()]))
+        self._log_driver.reconcile_sampling(self.context)
+        self.assertFalse(self._prunes())
+
+    def test_reconcile_sampling_keeps_drop_acls_of_flow_log(self):
+        self._log(event=log_const.DROP_EVENT)
+        self._set_pgs(self._pg_row(self.sg_id, [self._drop_acl()]))
+        self._log_driver.reconcile_sampling(self.context)
+        self.assertFalse(self._prunes())
+
+    def test_api_requests_do_not_prune(self):
+        log_obj = self._log(event=log_const.ACCEPT_EVENT)
+        self._log_driver.update_log(self.context, log_obj)
+        self.assertFalse(self._prunes())
+
+    def test_reconcile_sampling_prunes_drop_acls_when_disabled(self):
+        # Sampling was turned off while a DROP log is still enabled.
+        self.fake_cfg_network_log.ovn_acl_sampling = False
+        self._log(event=log_const.DROP_EVENT)
+        self._set_pgs(self._pg_row(self.sg_id, [self._drop_acl()]))
+        self._log_driver.reconcile_sampling(self.context)
+        self.assertTrue(self._prunes())
+        _pg_name, actions, collector_id = self._set_call()
+        self.assertEqual(set(), actions)
+        self.assertIsNone(collector_id)
+
+    def _conflicting_set_command(self):
+        cmd = mock.Mock(result={'conflicts': ['acl']})
+        self._nb_ovn.set_port_group_acl_sampling.return_value = cmd
+
+    def test_reconcile_sampling_periodic_conflicts_are_debug(self):
+        self._log()
+        self._conflicting_set_command()
+        with mock.patch.object(ovn_driver.LOG, 'warning') as warning:
+            self._log_driver.reconcile_sampling(self.context, periodic=True)
+        warning.assert_not_called()
+        with mock.patch.object(ovn_driver.LOG, 'warning') as warning:
+            self._log_driver.reconcile_sampling(self.context)
+        warning.assert_called_once()
+
+    def test_commit_sampling_retries_constraint_violation(self):
+        self._log()
+        txn_exit = self._nb_ovn.transaction.return_value.__exit__
+        txn_exit.side_effect = [
+            RuntimeError('OVSDB Error: constraint violation'), None]
+        self._log_driver.reconcile_sampling(self.context, [self.sg_id])
+        self.assertEqual(2, self._nb_ovn.transaction.call_count)
+
+    def test_commit_sampling_retry_recomputes(self):
+        log_obj = self._log()
+        txn_exit = self._nb_ovn.transaction.return_value.__exit__
+
+        def fail_and_disable(*args):
+            # The log is disabled while the first attempt is retried.
+            if txn_exit.call_count == 1:
+                self.logs[0]['enabled'] = False
+                raise RuntimeError('OVSDB Error: constraint violation')
+
+        txn_exit.side_effect = fail_and_disable
+        self._log_driver.reconcile_sampling(self.context,
+                                            [log_obj.resource_id])
+        calls = self._nb_ovn.set_port_group_acl_sampling.call_args_list
+        self.assertEqual(2, len(calls))
+        self.assertTrue(calls[0].args[1])
+        self.assertEqual(set(), calls[1].args[1])
+
+    def test_sampling_rechecked_after_commit(self):
+        # Another server disables the log while the transaction, retried
+        # by the IDL with the same commands, reattaches its sampling.
+        log_obj = self._log()
+        txn_exit = self._nb_ovn.transaction.return_value.__exit__
+
+        def disable(*args):
+            if txn_exit.call_count == 1:
+                self.logs[0]['enabled'] = False
+
+        txn_exit.side_effect = disable
+        self._log_driver.reconcile_sampling(self.context,
+                                            [log_obj.resource_id])
+        calls = self._nb_ovn.set_port_group_acl_sampling.call_args_list
+        self.assertEqual(2, len(calls))
+        self.assertTrue(calls[0].args[1])
+        self.assertEqual(set(), calls[1].args[1])
+
+    def test_sampling_not_rechecked_when_unchanged(self):
+        self._log()
+        self._log_driver.reconcile_sampling(self.context, [self.sg_id])
+        self.assertEqual(1, self._nb_ovn.transaction.call_count)
+
+    def test_sampling_recheck_is_bounded(self):
+        log_obj = self._log()
+        txn_exit = self._nb_ovn.transaction.return_value.__exit__
+
+        def toggle(*args):
+            self.logs[0]['enabled'] = not self.logs[0]['enabled']
+
+        txn_exit.side_effect = toggle
+        self._log_driver.reconcile_sampling(self.context,
+                                            [log_obj.resource_id])
+        self.assertEqual(1 + ovn_driver.SAMPLING_RECHECKS,
+                         self._nb_ovn.transaction.call_count)
+
+    def test_commit_sampling_gives_up(self):
+        self._log()
+        txn_exit = self._nb_ovn.transaction.return_value.__exit__
+        txn_exit.side_effect = RuntimeError(
+            'OVSDB Error: constraint violation')
+        self.assertRaises(RuntimeError, self._log_driver.reconcile_sampling,
+                          self.context, [self.sg_id])
+        self.assertEqual(ovn_driver.SAMPLING_TXN_ATTEMPTS,
+                         self._nb_ovn.transaction.call_count)
+
+    def test_commit_sampling_other_error_is_raised(self):
+        self._log()
+        txn_exit = self._nb_ovn.transaction.return_value.__exit__
+        txn_exit.side_effect = RuntimeError('timeout')
+        self.assertRaises(RuntimeError, self._log_driver.reconcile_sampling,
+                          self.context, [self.sg_id])
+        self.assertEqual(1, self._nb_ovn.transaction.call_count)
 
     def test_resource_update_mixed_outputs(self):
         packet = self._log(output_type=ovn_driver.OUTPUT_PACKET_LOG,

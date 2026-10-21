@@ -215,6 +215,17 @@ The following restrictions apply to the ``flow_sample`` output:
   packet logging, and they are kept while any enabled log of either output
   still needs them.
 
+The sampling of a security group is reapplied when its rules change and when
+its statefulness changes. The ``neutron-ovn-db-sync-util`` tool reapplies it
+after recreating the ACLs in repair mode. A periodic maintenance task
+reconciles the sampling of every security group with a flow-sample log or
+with Neutron sampling state left on its Port Group: it repairs missing Sample
+references, removes the Neutron Sample references when ``ovn_acl_sampling``
+is turned off while flow-sample logs are still enabled or when no log needs
+them any more, and removes the drop ACLs without packet logging that no
+enabled log needs. References to Samples that Neutron does not manage are
+never removed, and an ACL that has one is kept.
+
 The IPFIX records carry the observation domain ID, whose upper 8 bits are the
 ``Sampling_App`` ID of the stage and whose lower 24 bits are the OVN datapath
 tunnel key, and the observation point ID, which is the metadata of the Sample

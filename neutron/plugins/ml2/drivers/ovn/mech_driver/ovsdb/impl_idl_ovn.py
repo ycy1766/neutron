@@ -555,10 +555,12 @@ class OvsdbNbOvnIdl(nb_impl_idl.OvnNbApiIdlImpl, Backend):
 
     def set_port_group_acl_sampling(self, port_group, acl_actions,
                                     collector_id, if_exists=True,
-                                    raise_on_conflict=False):
+                                    raise_on_conflict=False,
+                                    remove_unlogged_drop_acls=False):
         return cmd.SetPortGroupAclSamplingCommand(
             self, port_group, acl_actions, collector_id, if_exists=if_exists,
-            raise_on_conflict=raise_on_conflict)
+            raise_on_conflict=raise_on_conflict,
+            remove_unlogged_drop_acls=remove_unlogged_drop_acls)
 
     def add_static_route(self, lrouter, maintain_bfd=False, **columns):
         return cmd.AddStaticRouteCommand(self, lrouter, maintain_bfd,

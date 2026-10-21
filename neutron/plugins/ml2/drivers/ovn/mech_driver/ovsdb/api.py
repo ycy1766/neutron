@@ -275,7 +275,8 @@ class API(api.API, metaclass=abc.ABCMeta):
     @abc.abstractmethod
     def set_port_group_acl_sampling(self, port_group, acl_actions,
                                     collector_id, if_exists=True,
-                                    raise_on_conflict=False):
+                                    raise_on_conflict=False,
+                                    remove_unlogged_drop_acls=False):
         """Converge the Neutron sample references of a Port Group's ACLs.
 
         :param port_group:   The Port Group name
@@ -290,6 +291,10 @@ class API(api.API, metaclass=abc.ABCMeta):
         :param raise_on_conflict: Fail if a required reference is not
                              managed by Neutron instead of reporting it
         :type raise_on_conflict: bool
+        :param remove_unlogged_drop_acls: Remove the per-SG drop ACLs
+                             without packet logging, except those that
+                             reference a Sample not managed by Neutron
+        :type remove_unlogged_drop_acls: bool
         :returns:            :class:`Command` with a dict of conflicts and
                              counters as result
         """

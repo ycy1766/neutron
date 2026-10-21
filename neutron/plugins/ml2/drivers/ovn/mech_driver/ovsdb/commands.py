@@ -1423,13 +1423,53 @@ class SetPortGroupAclSamplingCommand(command.BaseCommand):
     """
 
     def __init__(self, api, port_group, acl_actions, collector_id,
-                 if_exists=True, raise_on_conflict=False):
+                 if_exists=True, raise_on_conflict=False,
+                 remove_unlogged_drop_acls=False):
         super().__init__(api)
         self.port_group = port_group
         self.acl_actions = frozenset(acl_actions or ())
         self.collector_id = collector_id
         self.if_exists = if_exists
         self.raise_on_conflict = raise_on_conflict
+        self.remove_unlogged_drop_acls = remove_unlogged_drop_acls
+
+    def _remove_drop_acls(self, pg, owned_uuids):
+        """Remove the per-SG drop ACLs that only served sampling.
+
+        A drop ACL at the per-SG drop priority without packet logging is
+        removed unless one of its stages references a Sample that Neutron
+        does not manage; such an ACL is kept and its reference is reported
+        as a conflict by the convergence that follows.
+
+        :returns: the UUIDs of the removed ACLs.
+        """
+        removed = set()
+        for acl in list(pg.acls):
+            if (acl.priority != ovn_const.ACL_PRIORITY_LOG_DROP or
+                    acl.action != ovn_const.ACL_ACTION_DROP):
+                continue
+            # The decision depends on these columns and on the referenced
+            # Samples; fail the transaction if they change.
+            acl.verify('log')
+            acl.verify('external_ids')
+            if getattr(acl, 'log', False):
+                continue
+            foreign = False
+            for stage in sampling.STAGES:
+                acl.verify(sampling.STAGE_ACL_COLUMN[stage])
+                state = sampling.classify_attachment(acl, stage, owned_uuids)
+                sample = sampling.referenced_sample(acl, stage)
+                if sample is not None:
+                    sample.verify('metadata')
+                    sample.verify('collectors')
+                if state == sampling.ATTACHMENT_FOREIGN:
+                    foreign = True
+            if foreign:
+                continue
+            pg.delvalue('acls', acl)
+            acl.delete()
+            removed.add(acl.uuid)
+        return removed
 
     def _owned_collectors(self):
         owned = [c for c in self.api.tables['Sample_Collector'].rows.values()
@@ -1466,6 +1506,9 @@ class SetPortGroupAclSamplingCommand(command.BaseCommand):
                 _('Port Group %s does not exist') % self.port_group)
         owned_uuids, target = self._owned_collectors()
         pg.verify('acls')
+        removed = set()
+        if self.remove_unlogged_drop_acls:
+            removed = self._remove_drop_acls(pg, owned_uuids)
 
         samples_by_md = {}
         for sample in self.api.tables['Sample'].rows.values():
@@ -1477,6 +1520,8 @@ class SetPortGroupAclSamplingCommand(command.BaseCommand):
         conflicts = []
         candidates = collections.defaultdict(list)
         for acl in pg.acls:
+            if acl.uuid in removed:
+                continue
             wanted = self._wanted_stages(acl)
             identity_action = sampling.observation_action(acl.action)
             for stage in sampling.STAGES:

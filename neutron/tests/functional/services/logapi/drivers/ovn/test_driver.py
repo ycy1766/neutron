@@ -588,6 +588,12 @@ class LogApiTestCaseFlowSample(LogApiTestCaseComplex):
         self.log_plugin.update_log(self.ctxt, log_obj['id'], log_data)
         self._check_sgrs_sampled(self.sg2rs, ovn_sampling.STAGES)
 
+    def test_new_rule_is_sampled(self):
+        self.log_plugin.create_log(self.ctxt, self._flow_log_data(self.sg1))
+        new_rule = self._create_security_group_rule(self.sg1, 443)
+        self._check_sgrs_sampled(self.sg1rs + [new_rule],
+                                 ovn_sampling.STAGES)
+
     def test_drop_acls_shared_with_packet_log(self):
         packet_data = self._log_data(sg_id=self.sg3)
         packet_data['log']['event'] = log_const.DROP_EVENT
@@ -650,6 +656,32 @@ class LogApiTestCaseFlowSample(LogApiTestCaseComplex):
         log_data['log']['target_id'] = self.port1
         self.assertRaises(log_exc.FlowSampleSelectorNotSupported,
                           self.log_plugin.create_log, self.ctxt, log_data)
+
+    def test_statefulness_change_reapplies_sampling(self):
+        sg = self._create_security_group('test_sg_stateful')
+        rule = self._create_security_group_rule(sg, 8080)
+        self.log_plugin.create_log(self.ctxt, self._flow_log_data(sg))
+        self._check_sgrs_sampled([rule], ovn_sampling.STAGES)
+
+        data = {'security_group': {'stateful': False}}
+        req = self.new_update_request('security-groups', data, sg, self.fmt)
+        res = req.get_response(self.api)
+        self.assertEqual(200, res.status_int)
+        # Stateless rules are only sampled on the new stage.
+        self._check_sgrs_sampled([rule], (ovn_sampling.STAGE_NEW,))
+
+    def test_reconcile_sampling_repairs_references(self):
+        self.log_plugin.create_log(self.ctxt, self._flow_log_data(self.sg1))
+        acl = self._find_security_group_rule_row_by_id(self.sg1rs[0])
+        self.nb_api.db_set('ACL', acl.uuid, ('sample_new', [])).execute(
+            check_error=True)
+        self._check_acl_sampled(
+            self._find_security_group_rule_row_by_id(self.sg1rs[0]),
+            (ovn_sampling.STAGE_EST,))
+
+        self.assertEqual([self.sg1],
+                         self.log_driver.reconcile_sampling(self.ctxt))
+        self._check_sgrs_sampled(self.sg1rs, ovn_sampling.STAGES)
 
     def test_loggable_resources_advertise_output_types(self):
         resources = self.log_plugin.get_loggable_resources(self.ctxt)

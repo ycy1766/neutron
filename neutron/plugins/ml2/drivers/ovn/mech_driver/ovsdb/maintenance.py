@@ -54,6 +54,7 @@ from neutron.objects import router as router_obj
 from neutron.objects import securitygroup as sg_obj
 from neutron.services.bgp import constants as bgp_const
 from neutron.services.evpn import constants as evpn_const
+from neutron.services.logapi.drivers.ovn import driver as ovn_log_driver
 from neutron.services.pvlan.drivers.ovn import driver as pvlan_ovn_driver
 
 
@@ -1070,6 +1071,31 @@ class DBInconsistenciesPeriodics(SchemaAwarePeriodicsBase):
             cfg.CONF.network_log.local_output_log_base or "acl_log_meter")
         self._ovn_client.create_ovn_fair_meter(meter_name, from_reload=True)
         raise periodics.NeverAgain()
+
+    @has_lock_periodic(spacing=ovn_const.DB_CONSISTENCY_CHECK_INTERVAL,
+                       run_immediately=True)
+    @log_maintenance_task(
+        start_message='Check the OVN ACL sampling of the flow-sample '
+                      'network logs.')
+    def check_acl_sampling_consistency(self):
+        """Converge the ACL sampling of the flow-sample network logs.
+
+        Rule ACLs can be created without their Sample references when a
+        notification is missed or a sampling transaction fails, and the
+        references of enabled logs remain when the operator disables ACL
+        sampling. The logging driver recomputes the desired state of each
+        security group selected by a flow-sample log from the stored logs
+        and the configuration, so this task repairs both cases. It also
+        removes the sampling left on security groups whose flow-sample
+        logs no longer exist.
+        """
+        driver = ovn_log_driver.DRIVER
+        if driver is None:
+            return
+        sg_ids = driver.reconcile_sampling(n_context.get_admin_context(),
+                                           periodic=True)
+        LOG.debug("Reconciled the OVN ACL sampling of %d security groups",
+                  len(sg_ids))
 
     @has_lock_periodic(spacing=86400, run_immediately=True)
     @log_maintenance_task(

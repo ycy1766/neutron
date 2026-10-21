@@ -532,6 +532,10 @@ class OVNMechanismDriver(api.MechanismDriver):
                     # The replaced ACLs lose their sampling references.
                     self.log_driver.sync_security_group_sampling(
                         context, security_group['id'], txn)
+                # The logs can have changed while the transaction was
+                # retried with the commands built before.
+                self.log_driver.resync_security_group_sampling(
+                    context, security_group['id'])
 
         ovn_revision_numbers_db.bump_revision(
             context, security_group, ovn_const.TYPE_SECURITY_GROUPS)
