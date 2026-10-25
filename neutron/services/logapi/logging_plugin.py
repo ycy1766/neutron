@@ -146,14 +146,13 @@ class LoggingPlugin(log_ext.LoggingPluginBase):
     def _check_enable_log(self, context, log_id):
         """Validate a log that is being enabled.
 
-        A disabled log with an output other than packet logging is
-        validated again before it is enabled, as the deployment may have
-        changed since it was created. Enabling it requires the same
-        permission as creating it.
+        Every enable request for an output other than packet logging
+        requires the same permission as creating it. The stored enabled
+        state can change concurrently and must not bypass this check.
+        Validate support again as the deployment may have changed.
         """
         log_obj = self._get_log(context, log_id)
-        if (log_obj.enabled or
-                validators.get_log_output_type(log_obj) ==
+        if (validators.get_log_output_type(log_obj) ==
                 output_apidef.PACKET_LOG):
             return
         policy.enforce(context, 'create_log:output_type',

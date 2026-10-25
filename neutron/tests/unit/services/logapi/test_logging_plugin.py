@@ -225,11 +225,12 @@ class TestLoggingPlugin(base.BaseLogTestCase):
         self.log_plugin.driver_manager.call.assert_not_called()
 
     def test_update_log_flow_sample_already_enabled(self):
-        # Updating an enabled log does not validate it again, so that it
-        # can be updated after its output is no longer available.
         self.log_plugin.driver_manager.supported_output_types.return_value = {
-            output_apidef.PACKET_LOG}
+            output_apidef.PACKET_LOG, output_apidef.FLOW_SAMPLE}
         stored = mock.Mock(project_id='fake_project', enabled=True,
+                           resource_type='security_group',
+                           resource_id=uuidutils.generate_uuid(),
+                           target_id=None,
                            output_type=output_apidef.FLOW_SAMPLE)
         stored.id = uuidutils.generate_uuid()
         new_log = mock.Mock()
@@ -240,8 +241,55 @@ class TestLoggingPlugin(base.BaseLogTestCase):
                 log_cls.get_object.return_value = stored
                 self.log_plugin.update_log(self.ctxt, stored.id,
                                            {'log': {'enabled': True}})
-        enforce.assert_not_called()
+        enforce.assert_called_once_with(
+            self.ctxt, 'create_log:output_type',
+            {'project_id': 'fake_project'})
         self.assertTrue(new_log.update.called)
+
+    def test_update_log_flow_sample_concurrent_disable_denied(self):
+        stored = mock.Mock(project_id='fake_project', enabled=True,
+                           output_type=output_apidef.FLOW_SAMPLE)
+        stored.id = uuidutils.generate_uuid()
+        backend = {'enabled': True}
+        new_log = mock.Mock()
+
+        def read_before_disable(*args, **kwargs):
+            backend['enabled'] = False
+            return stored
+
+        def apply_enable():
+            backend['enabled'] = True
+
+        new_log.update.side_effect = apply_enable
+        with mock.patch.object(policy, 'enforce',
+                               side_effect=PermissionError) as enforce:
+            with mock.patch.object(log_object, 'Log',
+                                   return_value=new_log) as log_cls:
+                log_cls.get_object.side_effect = read_before_disable
+                self.assertRaises(
+                    PermissionError, self.log_plugin.update_log,
+                    self.ctxt, stored.id, {'log': {'enabled': True}})
+        enforce.assert_called_once_with(
+            self.ctxt, 'create_log:output_type',
+            {'project_id': 'fake_project'})
+        new_log.update.assert_not_called()
+        self.assertFalse(backend['enabled'])
+        self.log_plugin.driver_manager.call.assert_not_called()
+
+    def test_update_log_without_enable_skips_enable_validation(self):
+        for changes in ({'name': 'renamed'}, {'description': 'updated'},
+                        {'enabled': False}):
+            with self.subTest(changes=changes):
+                new_log = mock.Mock()
+                with mock.patch.object(policy, 'enforce') as enforce:
+                    with mock.patch.object(log_object, 'Log',
+                                           return_value=new_log) as log_cls:
+                        self.log_plugin.update_log(
+                            self.ctxt, uuidutils.generate_uuid(),
+                            {'log': changes})
+                enforce.assert_not_called()
+                log_cls.get_object.assert_not_called()
+                new_log.update.assert_called_once_with()
 
     def test_get_loggable_resources(self):
         self.log_plugin.driver_manager.supported_output_types.return_value = {

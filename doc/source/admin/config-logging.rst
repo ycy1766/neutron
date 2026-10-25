@@ -201,6 +201,10 @@ The following restrictions apply to the ``flow_sample`` output:
 * Creating or enabling such a log requires the ``create_log:output_type``
   policy, which defaults to administrators, because a shared security group
   can contain the ports of other projects.
+  Every update that explicitly sets ``enabled=True`` checks this policy and
+  output support, even if the log is already enabled. Updating only the name
+  or description, or disabling a log, does not perform this enable check;
+  the normal update policy still applies.
 * The output of a log cannot be changed. Create a replacement log instead.
 * Using enabled ``packet_log`` and ``flow_sample`` logs concurrently on the
   same security group is not supported. The API does not reject this
